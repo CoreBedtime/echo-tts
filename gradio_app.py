@@ -1073,6 +1073,18 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
 
 
 if __name__ == "__main__":
+    # Check for share flag via environment variable
+    share = os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes")
+
+    if share:
+        print("\n" + "="*60)
+        print("🌐 Creating public shareable URL...")
+        print("="*60)
+
     demo.launch(
-        allowed_paths=[str(AUDIO_PROMPT_FOLDER)]
+        allowed_paths=[str(AUDIO_PROMPT_FOLDER)],
+        share=share,
     )
+
+    if share:
+        print("\n💡 Public URL generated! Share it with others to test your model.")
