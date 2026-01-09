@@ -673,7 +673,7 @@ def transcribe_audio_files_parakeet(
                 sampling_rate=16000,
                 return_tensors="pt"
             )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            inputs = {k: v.to(device).to(torch_dtype) for k, v in inputs.items()}
 
             # Generate transcription
             with torch.no_grad():
