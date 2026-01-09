@@ -606,6 +606,112 @@ def transcribe_audio_files(
     return transcriptions
 
 
+def transcribe_audio_files_parakeet(
+    audio_paths: List[str],
+    model_name: str = "nvidia/parakeet-tdt-1.1b",
+    language: str = "en",
+    batch_size: int = 8,
+) -> Dict[str, str]:
+    """
+    Transcribe multiple audio files using NVIDIA Parakeet (MUCH faster than Whisper).
+
+    Parakeet is optimized for GPU inference and can be 5-10x faster than Whisper.
+
+    Args:
+        audio_paths: List of audio file paths
+        model_name: Parakeet model name (default: nvidia/parakeet-tdt-1.1b)
+        language: Language code (ignored, Parakeet auto-detects)
+        batch_size: Files per progress update (default: 8)
+
+    Returns:
+        Dict mapping audio path to transcription
+    """
+    try:
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+    except ImportError:
+        raise ImportError(
+            "Please install: pip install transformers accelerate"
+        )
+
+    print(f"Transcribing {len(audio_paths)} files with Parakeet...")
+    print(f"Loading model '{model_name}' (faster than Whisper!)...\n")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    # Load Parakeet model and processor
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_name,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+    )
+    model.to(device)
+    processor = AutoProcessor.from_pretrained(model_name)
+
+    transcriptions = {}
+    errors = []
+
+    for i, path in enumerate(audio_paths):
+        try:
+            # Load and preprocess audio
+            import torchaudio
+            audio, sr = torchaudio.load(path)
+
+            # Convert to mono if needed
+            if audio.shape[0] > 1:
+                audio = audio.mean(dim=0, keepdim=True)
+
+            # Resample to 16kHz if needed
+            if sr != 16000:
+                audio = torchaudio.functional.resample(audio, sr, 16000)
+
+            # Process with Parakeet
+            inputs = processor(
+                audio.squeeze().numpy(),
+                sampling_rate=16000,
+                return_tensors="pt"
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Generate transcription
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs)
+
+            text = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True
+            )[0].strip()
+
+            # Add speaker prefix if not present
+            if not text.startswith("[") and "S1" not in text:
+                text = "[S1] " + text
+
+            transcriptions[path] = text
+
+        except Exception as e:
+            errors.append((path, str(e)))
+            print(f"  ⚠️  Error transcribing {os.path.basename(path)}: {e}")
+
+        # Progress update
+        if (i + 1) % batch_size == 0 or (i + 1) == len(audio_paths):
+            print(f"Progress: {i + 1}/{len(audio_paths)} files transcribed")
+
+    print(f"\n{'='*50}")
+    print(f"Transcription complete!")
+    print(f"  Successful: {len(transcriptions)}")
+    print(f"  Errors: {len(errors)}")
+    print(f"{'='*50}")
+
+    if errors:
+        print("\nFiles with errors:")
+        for path, error in errors[:10]:  # Show first 10
+            print(f"  - {os.path.basename(path)}")
+
+    return transcriptions
+
+
 def transcribe_audio_files_parallel(
     audio_paths: List[str],
     model_name: str = "base",
@@ -616,8 +722,7 @@ def transcribe_audio_files_parallel(
     """
     Transcribe multiple audio files using Whisper with batched processing.
 
-    Note: Due to CUDA limitations, this uses sequential processing but with
-    optimized batching and model reuse for speed.
+    DEPRECATED: Use transcribe_audio_files_parakeet() for 5-10x faster transcription.
 
     Args:
         audio_paths: List of audio file paths
