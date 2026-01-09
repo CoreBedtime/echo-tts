@@ -351,7 +351,19 @@ def compute_diffusion_loss(
 
     # Apply mask and average
     loss = loss * latent_mask.unsqueeze(-1).float()
-    loss = loss.sum() / (latent_mask.sum() * D + 1e-8)
+
+    # More numerically stable averaging
+    num_valid_elements = latent_mask.sum() * D
+    if num_valid_elements == 0:
+        print("Warning: No valid elements in batch, returning zero loss")
+        return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+    loss = loss.sum() / num_valid_elements
+
+    # Final safety check
+    if torch.isnan(loss) or torch.isinf(loss):
+        print("Warning: NaN/Inf detected in loss computation")
+        return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
     return loss
 
@@ -408,6 +420,7 @@ def train_epoch(
     model: EchoDiT,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
     device: str = "cuda",
     gradient_accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
@@ -420,6 +433,7 @@ def train_epoch(
         model: EchoDiT model with LoRA
         dataloader: Training dataloader
         optimizer: Optimizer
+        scheduler: Optional learning rate scheduler
         device: Device
         gradient_accumulation_steps: Accumulate gradients over N steps
         max_grad_norm: Maximum gradient norm for clipping
@@ -435,9 +449,15 @@ def train_epoch(
     optimizer.zero_grad()
 
     for step, batch in enumerate(dataloader):
-        # Mixed precision forward
-        with torch.cuda.amp.autocast(enabled=scaler is not None, dtype=torch.bfloat16):
+        # Mixed precision forward - use new API
+        with torch.amp.autocast('cuda', enabled=scaler is not None, dtype=torch.bfloat16):
             loss = training_step(model, batch, device)
+
+            # Check for NaN before scaling
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN/Inf loss detected at step {step}, skipping batch")
+                continue
+
             loss = loss / gradient_accumulation_steps
 
         # Backward
@@ -453,14 +473,33 @@ def train_epoch(
         if (step + 1) % gradient_accumulation_steps == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+                # Check gradients for NaN
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Warning: NaN/Inf gradient norm detected at step {step}, skipping update")
+                    optimizer.zero_grad()
+                    scaler.update()
+                    continue
+
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Warning: NaN/Inf gradient norm detected at step {step}, skipping update")
+                    optimizer.zero_grad()
+                    continue
+
                 optimizer.step()
 
             optimizer.zero_grad()
+
+            # Step scheduler after optimizer (fixed order)
+            if scheduler is not None:
+                scheduler.step()
 
     return total_loss / max(num_batches, 1)
 
