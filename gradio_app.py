@@ -28,6 +28,7 @@ from inference import (
     compile_fish_ae,
     sample_euler_cfg_independent_guidances
 )
+from lora import apply_lora_to_model, load_lora_checkpoint
 
 # --------------------------------------------------------------------
 # IF ON 8GB VRAM GPU, SET FISH_AE_DTYPE to bfloat16 and DEFAULT_SAMPLE_LATENT_LENGTH to < 640 (e.g., 576)
@@ -57,9 +58,13 @@ TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------
 # Model loading (eager for local use)
-model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
+base_model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
 fish_ae = load_fish_ae_from_hf(dtype=FISH_AE_DTYPE)
 pca_state = load_pca_state_from_hf()
+
+# Active model (base or with LoRA)
+model = base_model
+current_lora_path = None
 
 model_compiled = None
 fish_ae_compiled = None
@@ -127,32 +132,83 @@ def to_bool(val: Any) -> bool:
 
 def find_min_bucket_gte(values_str: str, actual_length: int) -> int | None:
     """Parse comma-separated values and find minimum value >= actual_length.
-    
+
     If a single value is provided (no comma), returns that value directly.
     If comma-separated, finds the smallest bucket that can fit the content.
     Returns None if empty string.
     """
     if not values_str or not values_str.strip():
         return None
-    
+
     values_str = values_str.strip()
-    
+
     # Single value case - return as-is
     if "," not in values_str:
         return int(values_str)
-    
+
     # Multiple values - find minimum >= actual_length
     values = [int(v.strip()) for v in values_str.split(",") if v.strip()]
     if not values:
         return None
-    
+
     # Find minimum value >= actual_length
     candidates = [v for v in values if v >= actual_length]
     if candidates:
         return min(candidates)
-    
+
     # If no value is >=, return the maximum (best effort)
     return max(values)
+
+
+def load_lora_model(lora_path: str | None) -> Tuple[Any, str]:
+    """Load LoRA checkpoint and apply to model.
+
+    Returns:
+        Tuple of (model_with_lora, status_message)
+    """
+    global model, base_model, current_lora_path, model_compiled
+
+    # If no LoRA path or same as current, return current model
+    if not lora_path or lora_path == current_lora_path:
+        if current_lora_path:
+            return model, f"✅ Using LoRA: {Path(current_lora_path).name}"
+        return model, "ℹ️ Using base model (no LoRA)"
+
+    try:
+        # Load LoRA checkpoint to get config
+        checkpoint = torch.load(lora_path, map_location="cpu")
+        config = checkpoint.get("config", {})
+
+        # Reload base model fresh
+        model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
+
+        # Apply LoRA structure
+        model, _ = apply_lora_to_model(
+            model,
+            rank=config.get("rank", 32),
+            alpha=config.get("alpha", 32.0),
+            dropout=0.0,  # No dropout for inference
+            target_modules=config.get("target_modules", []),
+        )
+
+        # Load LoRA weights
+        load_lora_checkpoint(model, lora_path, device="cuda")
+        model.eval()
+
+        # Clear compiled model cache
+        model_compiled = None
+
+        current_lora_path = lora_path
+        lora_name = Path(lora_path).name
+
+        return model, f"✅ Loaded LoRA: {lora_name}"
+
+    except Exception as e:
+        # On error, revert to base model
+        model = base_model
+        current_lora_path = None
+        model_compiled = None
+        return model, f"❌ Error loading LoRA: {str(e)}"
 
 
 def generate_audio(
@@ -179,10 +235,14 @@ def generate_audio(
     audio_format: str,
     use_compile: bool,
     show_original_audio: bool,
+    lora_checkpoint_path: str,
     session_id: str,
-) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     """Generate audio using the model."""
-    global model_compiled, fish_ae_compiled
+    global model_compiled, fish_ae_compiled, model
+
+    # Load LoRA if provided
+    model, lora_status = load_lora_model(lora_checkpoint_path)
 
     if use_compile:
         if model_compiled is None:
@@ -316,6 +376,7 @@ def generate_audio(
         gr.update(visible=(show_original_audio and speaker_audio is not None)),
         gr.update(visible=(reconstruct_first_30_seconds and speaker_audio is not None)),
         gr.update(visible=show_reference_section),
+        gr.update(value=lora_status, visible=True),
     )
 
 
@@ -632,6 +693,27 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                 label="Speaker Reference Audio (first five minutes used; blank for no speaker reference)",
                 max_length=600,
             )
+
+    gr.HTML('<hr class="section-separator">')
+
+    # LoRA Checkpoint Section
+    gr.Markdown("# LoRA Fine-Tuning (Optional)")
+    with gr.Accordion("🎯 Load Custom LoRA Checkpoint", open=False):
+        gr.Markdown(
+            """
+            Enter the path to a LoRA checkpoint (`.pt` file) from fine-tuning to apply custom style adaptation.
+
+            <div class="tip-box">
+            💡 **Tip:** Leave blank to use the base Echo-TTS model. Provide a path to a LoRA checkpoint to use a fine-tuned style (e.g., rap, singing, accents).
+            </div>
+            """
+        )
+        lora_checkpoint = gr.Textbox(
+            label="LoRA Checkpoint Path",
+            placeholder="./checkpoints/lora_best.pt",
+            lines=1,
+        )
+        lora_status = gr.Markdown("ℹ️ Using base model (no LoRA)", visible=True)
 
     gr.HTML('<hr class="section-separator">')
     gr.Markdown("# Text Prompt")
@@ -953,6 +1035,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             audio_format,
             compile_checkbox,
             show_original_audio,
+            lora_checkpoint,
             session_id_state,
         ],
         outputs=[
@@ -965,6 +1048,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             original_accordion,
             reference_accordion,
             reference_audio_header,
+            lora_status,
         ],
     )
 
