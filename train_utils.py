@@ -25,7 +25,6 @@ from inference import (
     ae_decode,
     get_speaker_latent_and_mask,
     get_text_input_ids_and_mask,
-    load_audio,
 )
 
 
@@ -44,7 +43,7 @@ class TrainingSample:
 def load_audio_tensor(
     path: str,
     sample_rate: int = 44100,
-    max_duration: float = 30.0,
+    max_duration: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Load and preprocess audio file.
@@ -52,19 +51,12 @@ def load_audio_tensor(
     Args:
         path: Path to audio file
         sample_rate: Target sample rate
-        max_duration: Maximum duration in seconds
+        max_duration: Maximum duration in seconds (None = load full file)
 
     Returns:
         Audio tensor of shape (1, samples)
     """
-    # Try using inference.load_audio first
-    try:
-        audio = load_audio(path, max_duration=int(max_duration))
-        return audio
-    except Exception:
-        pass
-
-    # Fallback to torchaudio
+    # Use torchaudio to load the file
     audio, sr = torchaudio.load(path)
 
     # Convert to mono
@@ -75,10 +67,11 @@ def load_audio_tensor(
     if sr != sample_rate:
         audio = torchaudio.functional.resample(audio, sr, sample_rate)
 
-    # Truncate to max duration
-    max_samples = int(max_duration * sample_rate)
-    if audio.shape[1] > max_samples:
-        audio = audio[:, :max_samples]
+    # Truncate to max duration if specified
+    if max_duration is not None:
+        max_samples = int(max_duration * sample_rate)
+        if audio.shape[1] > max_samples:
+            audio = audio[:, :max_samples]
 
     # Normalize
     audio = audio / torch.clamp(audio.abs().max(), min=1.0)
@@ -611,9 +604,13 @@ def transcribe_audio_files_parakeet(
     model_name: str = "nvidia/parakeet-tdt-1.1b",
     language: str = "en",
     batch_size: int = 8,
+    chunk_duration: float = 30.0,
+    overlap: float = 0.1,
 ) -> Dict[str, str]:
     """
     Transcribe multiple audio files using NVIDIA Parakeet (MUCH faster than Whisper).
+
+    Now supports FULL SONG transcription by chunking long audio files!
 
     Parakeet is optimized for GPU inference and can be 5-10x faster than Whisper.
 
@@ -622,9 +619,11 @@ def transcribe_audio_files_parakeet(
         model_name: Parakeet model name (default: nvidia/parakeet-tdt-1.1b)
         language: Language code (ignored, Parakeet auto-detects)
         batch_size: Files per progress update (default: 8)
+        chunk_duration: Duration of each chunk in seconds (default: 30.0)
+        overlap: Overlap between chunks as fraction (0.0-1.0, default: 0.1 = 10%)
 
     Returns:
-        Dict mapping audio path to transcription
+        Dict mapping audio path to transcription (full song, all chunks combined)
     """
     try:
         import torch
@@ -635,7 +634,8 @@ def transcribe_audio_files_parakeet(
         )
 
     print(f"Transcribing {len(audio_paths)} files with Parakeet...")
-    print(f"Loading model '{model_name}' (faster than Whisper!)...\n")
+    print(f"Loading model '{model_name}' (faster than Whisper!)...")
+    print(f"Chunking long audio into {chunk_duration}s segments with {overlap*100:.0f}% overlap\n")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -655,7 +655,7 @@ def transcribe_audio_files_parakeet(
 
     for i, path in enumerate(audio_paths):
         try:
-            # Load and preprocess audio
+            # Load and preprocess audio (FULL FILE)
             import torchaudio
             audio, sr = torchaudio.load(path)
 
@@ -666,29 +666,62 @@ def transcribe_audio_files_parakeet(
             # Resample to 16kHz if needed
             if sr != 16000:
                 audio = torchaudio.functional.resample(audio, sr, 16000)
+                sr = 16000
 
-            # Process with Parakeet
-            inputs = processor(
-                audio.squeeze().numpy(),
-                sampling_rate=16000,
-                return_tensors="pt"
-            )
-            inputs = {k: v.to(device).to(torch_dtype) for k, v in inputs.items()}
+            # Calculate chunk parameters
+            chunk_samples = int(chunk_duration * sr)
+            hop_samples = int(chunk_samples * (1 - overlap))
+            total_samples = audio.shape[1]
 
-            # Generate transcription
-            with torch.no_grad():
-                generated_ids = model.generate(**inputs)
+            # Segment audio into chunks
+            chunks = []
+            for start in range(0, total_samples, hop_samples):
+                end = min(start + chunk_samples, total_samples)
+                chunk = audio[:, start:end]
 
-            text = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True
-            )[0].strip()
+                # Only process chunks that are at least 1 second
+                if chunk.shape[1] >= sr:
+                    chunks.append(chunk)
+
+                # Stop if we've covered the whole file
+                if end >= total_samples:
+                    break
+
+            # Transcribe each chunk
+            chunk_transcriptions = []
+            for chunk in chunks:
+                # Process with Parakeet
+                inputs = processor(
+                    chunk.squeeze().numpy(),
+                    sampling_rate=16000,
+                    return_tensors="pt"
+                )
+                inputs = {k: v.to(device).to(torch_dtype) for k, v in inputs.items()}
+
+                # Generate transcription
+                with torch.no_grad():
+                    generated_ids = model.generate(**inputs)
+
+                text = processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True
+                )[0].strip()
+
+                if text:  # Only add non-empty transcriptions
+                    chunk_transcriptions.append(text)
+
+            # Combine all chunk transcriptions
+            full_text = " ".join(chunk_transcriptions)
 
             # Add speaker prefix if not present
-            if not text.startswith("[") and "S1" not in text:
-                text = "[S1] " + text
+            if not full_text.startswith("[") and "S1" not in full_text:
+                full_text = "[S1] " + full_text
 
-            transcriptions[path] = text
+            transcriptions[path] = full_text
+
+            # Show chunk count for this file
+            duration_sec = total_samples / sr
+            print(f"  {os.path.basename(path)}: {duration_sec:.1f}s -> {len(chunks)} chunks")
 
         except Exception as e:
             errors.append((path, str(e)))
@@ -696,13 +729,13 @@ def transcribe_audio_files_parakeet(
 
         # Progress update
         if (i + 1) % batch_size == 0 or (i + 1) == len(audio_paths):
-            print(f"Progress: {i + 1}/{len(audio_paths)} files transcribed")
+            print(f"\nProgress: {i + 1}/{len(audio_paths)} files transcribed\n")
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"Transcription complete!")
     print(f"  Successful: {len(transcriptions)}")
     print(f"  Errors: {len(errors)}")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
 
     if errors:
         print("\nFiles with errors:")
