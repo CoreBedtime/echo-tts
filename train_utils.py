@@ -606,6 +606,95 @@ def transcribe_audio_files(
     return transcriptions
 
 
+def transcribe_audio_files_parallel(
+    audio_paths: List[str],
+    model_name: str = "base",
+    language: str = "en",
+    num_workers: int = 4,
+    batch_size: int = 8,
+) -> Dict[str, str]:
+    """
+    Transcribe multiple audio files in parallel using multiprocessing.
+
+    Args:
+        audio_paths: List of audio file paths
+        model_name: Whisper model name
+        language: Language code
+        num_workers: Number of parallel workers (default: 4)
+        batch_size: Files per batch for progress updates (default: 8)
+
+    Returns:
+        Dict mapping audio path to transcription
+    """
+    try:
+        from multiprocessing import Pool
+        from functools import partial
+    except ImportError as e:
+        raise ImportError(
+            f"Please install required packages: {e}"
+        )
+
+    def transcribe_single(path: str, model_name: str, language: str) -> tuple:
+        """Helper function to transcribe a single file."""
+        try:
+            import whisper
+            # Each worker loads its own model instance
+            model = whisper.load_model(model_name)
+            result = model.transcribe(path, language=language)
+            text = result["text"].strip()
+
+            # Add speaker prefix if not present
+            if not text.startswith("[") and "S1" not in text:
+                text = "[S1] " + text
+
+            return (path, text, None)
+        except Exception as e:
+            return (path, None, str(e))
+
+    print(f"Transcribing {len(audio_paths)} files with Whisper '{model_name}'...")
+    print(f"Using {num_workers} parallel workers")
+    print("This will be MUCH faster than sequential processing!\n")
+
+    transcriptions = {}
+    errors = []
+
+    # Create partial function with fixed model and language
+    transcribe_fn = partial(transcribe_single, model_name=model_name, language=language)
+
+    # Process in batches for progress updates
+    with Pool(processes=num_workers) as pool:
+        for batch_start in range(0, len(audio_paths), batch_size):
+            batch_paths = audio_paths[batch_start:batch_start + batch_size]
+
+            # Process batch in parallel
+            results = pool.map(transcribe_fn, batch_paths)
+
+            # Collect results
+            for path, text, error in results:
+                if error:
+                    errors.append((path, error))
+                    print(f"  ⚠️  Error transcribing {os.path.basename(path)}: {error}")
+                else:
+                    transcriptions[path] = text
+
+            # Progress update
+            completed = min(batch_start + batch_size, len(audio_paths))
+            print(f"Progress: {completed}/{len(audio_paths)} files transcribed")
+
+    print(f"\n{'='*50}")
+    print(f"Transcription complete!")
+    print(f"  Successful: {len(transcriptions)}")
+    print(f"  Errors: {len(errors)}")
+    print(f"{'='*50}")
+
+    if errors:
+        print("\nFiles with errors:")
+        for path, error in errors[:10]:  # Show first 10
+            print(f"  - {os.path.basename(path)}")
+
+    return transcriptions
+
+
 # ============================================================================
 # Utilities
 # ============================================================================
