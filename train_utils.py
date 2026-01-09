@@ -606,6 +606,27 @@ def transcribe_audio_files(
     return transcriptions
 
 
+def _transcribe_single_file(path: str, model_name: str, language: str) -> tuple:
+    """
+    Helper function to transcribe a single file.
+    Must be at module level for multiprocessing to work.
+    """
+    try:
+        import whisper
+        # Each worker loads its own model instance
+        model = whisper.load_model(model_name)
+        result = model.transcribe(path, language=language)
+        text = result["text"].strip()
+
+        # Add speaker prefix if not present
+        if not text.startswith("[") and "S1" not in text:
+            text = "[S1] " + text
+
+        return (path, text, None)
+    except Exception as e:
+        return (path, None, str(e))
+
+
 def transcribe_audio_files_parallel(
     audio_paths: List[str],
     model_name: str = "base",
@@ -634,23 +655,6 @@ def transcribe_audio_files_parallel(
             f"Please install required packages: {e}"
         )
 
-    def transcribe_single(path: str, model_name: str, language: str) -> tuple:
-        """Helper function to transcribe a single file."""
-        try:
-            import whisper
-            # Each worker loads its own model instance
-            model = whisper.load_model(model_name)
-            result = model.transcribe(path, language=language)
-            text = result["text"].strip()
-
-            # Add speaker prefix if not present
-            if not text.startswith("[") and "S1" not in text:
-                text = "[S1] " + text
-
-            return (path, text, None)
-        except Exception as e:
-            return (path, None, str(e))
-
     print(f"Transcribing {len(audio_paths)} files with Whisper '{model_name}'...")
     print(f"Using {num_workers} parallel workers")
     print("This will be MUCH faster than sequential processing!\n")
@@ -659,7 +663,7 @@ def transcribe_audio_files_parallel(
     errors = []
 
     # Create partial function with fixed model and language
-    transcribe_fn = partial(transcribe_single, model_name=model_name, language=language)
+    transcribe_fn = partial(_transcribe_single_file, model_name=model_name, language=language)
 
     # Process in batches for progress updates
     with Pool(processes=num_workers) as pool:
