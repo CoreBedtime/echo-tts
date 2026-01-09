@@ -606,27 +606,6 @@ def transcribe_audio_files(
     return transcriptions
 
 
-def _transcribe_single_file(path: str, model_name: str, language: str) -> tuple:
-    """
-    Helper function to transcribe a single file.
-    Must be at module level for multiprocessing to work.
-    """
-    try:
-        import whisper
-        # Each worker loads its own model instance
-        model = whisper.load_model(model_name)
-        result = model.transcribe(path, language=language)
-        text = result["text"].strip()
-
-        # Add speaker prefix if not present
-        if not text.startswith("[") and "S1" not in text:
-            text = "[S1] " + text
-
-        return (path, text, None)
-    except Exception as e:
-        return (path, None, str(e))
-
-
 def transcribe_audio_files_parallel(
     audio_paths: List[str],
     model_name: str = "base",
@@ -635,55 +614,55 @@ def transcribe_audio_files_parallel(
     batch_size: int = 8,
 ) -> Dict[str, str]:
     """
-    Transcribe multiple audio files in parallel using multiprocessing.
+    Transcribe multiple audio files using Whisper with batched processing.
+
+    Note: Due to CUDA limitations, this uses sequential processing but with
+    optimized batching and model reuse for speed.
 
     Args:
         audio_paths: List of audio file paths
         model_name: Whisper model name
         language: Language code
-        num_workers: Number of parallel workers (default: 4)
-        batch_size: Files per batch for progress updates (default: 8)
+        num_workers: Ignored (kept for API compatibility)
+        batch_size: Files per progress update (default: 8)
 
     Returns:
         Dict mapping audio path to transcription
     """
     try:
-        from multiprocessing import Pool
-        from functools import partial
-    except ImportError as e:
+        import whisper
+    except ImportError:
         raise ImportError(
-            f"Please install required packages: {e}"
+            "Please install whisper: pip install openai-whisper"
         )
 
     print(f"Transcribing {len(audio_paths)} files with Whisper '{model_name}'...")
-    print(f"Using {num_workers} parallel workers")
-    print("This will be MUCH faster than sequential processing!\n")
+    print(f"Loading model (this may take a minute for large-v3)...\n")
+
+    # Load model once and reuse (much faster than reloading)
+    model = whisper.load_model(model_name, device="cuda")
 
     transcriptions = {}
     errors = []
 
-    # Create partial function with fixed model and language
-    transcribe_fn = partial(_transcribe_single_file, model_name=model_name, language=language)
+    for i, path in enumerate(audio_paths):
+        try:
+            result = model.transcribe(path, language=language)
+            text = result["text"].strip()
 
-    # Process in batches for progress updates
-    with Pool(processes=num_workers) as pool:
-        for batch_start in range(0, len(audio_paths), batch_size):
-            batch_paths = audio_paths[batch_start:batch_start + batch_size]
+            # Add speaker prefix if not present
+            if not text.startswith("[") and "S1" not in text:
+                text = "[S1] " + text
 
-            # Process batch in parallel
-            results = pool.map(transcribe_fn, batch_paths)
+            transcriptions[path] = text
 
-            # Collect results
-            for path, text, error in results:
-                if error:
-                    errors.append((path, error))
-                    print(f"  ⚠️  Error transcribing {os.path.basename(path)}: {error}")
-                else:
-                    transcriptions[path] = text
+        except Exception as e:
+            errors.append((path, str(e)))
+            print(f"  ⚠️  Error transcribing {os.path.basename(path)}: {e}")
 
-            # Progress update
-            completed = min(batch_start + batch_size, len(audio_paths))
-            print(f"Progress: {completed}/{len(audio_paths)} files transcribed")
+        # Progress update
+        if (i + 1) % batch_size == 0 or (i + 1) == len(audio_paths):
+            print(f"Progress: {i + 1}/{len(audio_paths)} files transcribed")
 
     print(f"\n{'='*50}")
     print(f"Transcription complete!")
