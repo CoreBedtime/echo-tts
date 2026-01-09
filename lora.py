@@ -59,8 +59,8 @@ class LoRALinear(nn.Module):
 
         # LoRA delta: x @ A^T @ B^T * scaling
         lora_out = self.dropout(x)
-        lora_out = F.linear(lora_out, self.lora_A.to(x.device))  # x @ A^T
-        lora_out = F.linear(lora_out, self.lora_B.to(x.device))  # (x @ A^T) @ B^T
+        lora_out = F.linear(lora_out, self.lora_A.to(x.device, x.dtype))  # x @ A^T
+        lora_out = F.linear(lora_out, self.lora_B.to(x.device, x.dtype))  # (x @ A^T) @ B^T
 
         return result + lora_out * self.scaling
 
