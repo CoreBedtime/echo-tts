@@ -1,13 +1,12 @@
-
-import os
 import json
-import time
-import secrets
 import logging
+import os
+import secrets
+import time
 import warnings
-from pathlib import Path
-from typing import Tuple, Any
 from functools import partial
+from pathlib import Path
+from typing import Any, Tuple
 
 # see lines ~40-50 for running on lower VRAM GPUs
 
@@ -18,15 +17,15 @@ import torch
 import torchaudio
 
 from inference import (
-    load_model_from_hf,
-    load_fish_ae_from_hf,
-    load_pca_state_from_hf,
-    load_audio,
     ae_reconstruct,
-    sample_pipeline,
-    compile_model,
     compile_fish_ae,
-    sample_euler_cfg_independent_guidances
+    compile_model,
+    load_audio,
+    load_fish_ae_from_hf,
+    load_model_from_hf,
+    load_pca_state_from_hf,
+    sample_euler_cfg_independent_guidances,
+    sample_pipeline,
 )
 from lora import apply_lora_to_model, load_lora_checkpoint
 
@@ -38,7 +37,7 @@ MODEL_DTYPE = torch.bfloat16
 FISH_AE_DTYPE = torch.float32
 # FISH_AE_DTYPE = torch.bfloat16 # USE THIS IF OOM ON 8GB vram GPU
 
-DEFAULT_SAMPLE_LATENT_LENGTH = 640 # decrease if OOM on 8GB vram GPU
+DEFAULT_SAMPLE_LATENT_LENGTH = 640  # decrease if OOM on 8GB vram GPU
 # DEFAULT_SAMPLE_LATENT_LENGTH = 576  # (example, ~27 seconds rather than ~30; can change depending on what fits in VRAM)
 
 # NOTE peak S1-DAC decoding VRAM > peak latent sampling VRAM, so decoding in chunks (which is posisble as S1-DAC is causal) would allow for full 640-length generation on lower VRAM GPUs
@@ -68,6 +67,7 @@ current_lora_path = None
 
 model_compiled = None
 fish_ae_compiled = None
+
 
 # --------------------------------------------------------------------
 # Helper functions
@@ -100,7 +100,13 @@ def cleanup_temp_audio(dir_: Path, user_id: str | None, max_age_sec: int = 60 * 
                 pass
 
 
-def save_audio_with_format(audio_tensor: torch.Tensor, base_path: Path, filename: str, sample_rate: int, audio_format: str) -> Path:
+def save_audio_with_format(
+    audio_tensor: torch.Tensor,
+    base_path: Path,
+    filename: str,
+    sample_rate: int,
+    audio_format: str,
+) -> Path:
     """Save audio in specified format, fallback to WAV if MP3 encoding fails."""
     if audio_format == "mp3":
         try:
@@ -160,8 +166,14 @@ def find_min_bucket_gte(values_str: str, actual_length: int) -> int | None:
     return max(values)
 
 
-def load_lora_model(lora_path: str | None) -> Tuple[Any, str]:
+def load_lora_model(
+    lora_path: str | None, lora_strength: float = 1.0
+) -> Tuple[Any, str]:
     """Load LoRA checkpoint and apply to model.
+
+    Args:
+        lora_path: Path to LoRA checkpoint file
+        lora_strength: Scaling factor for LoRA strength (0.0 to 2.0)
 
     Returns:
         Tuple of (model_with_lora, status_message)
@@ -182,11 +194,14 @@ def load_lora_model(lora_path: str | None) -> Tuple[Any, str]:
         # Reload base model fresh
         model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
 
-        # Apply LoRA structure
+        # Apply LoRA structure with strength-scaled alpha
+        base_alpha = config.get("alpha", 32.0)
+        scaled_alpha = base_alpha * lora_strength
+
         model, _ = apply_lora_to_model(
             model,
             rank=config.get("rank", 32),
-            alpha=config.get("alpha", 32.0),
+            alpha=scaled_alpha,
             dropout=0.0,  # No dropout for inference
             target_modules=config.get("target_modules", []),
         )
@@ -201,7 +216,7 @@ def load_lora_model(lora_path: str | None) -> Tuple[Any, str]:
         current_lora_path = lora_path
         lora_name = Path(lora_path).name
 
-        return model, f"✅ Loaded LoRA: {lora_name}"
+        return model, f"✅ Loaded LoRA: {lora_name} (strength: {lora_strength:.2f})"
 
     except Exception as e:
         # On error, revert to base model
@@ -236,13 +251,14 @@ def generate_audio(
     use_compile: bool,
     show_original_audio: bool,
     lora_checkpoint_path: str,
+    lora_strength: float,
     session_id: str,
 ) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     """Generate audio using the model."""
     global model_compiled, fish_ae_compiled, model
 
     # Load LoRA if provided
-    model, lora_status = load_lora_model(lora_checkpoint_path)
+    model, lora_status = load_lora_model(lora_checkpoint_path, lora_strength)
 
     if use_compile:
         if model_compiled is None:
@@ -265,7 +281,9 @@ def generate_audio(
     num_steps_int = min(max(int(num_steps), 1), 80)
     rng_seed_int = int(rng_seed) if rng_seed is not None else 0
     cfg_scale_text_val = float(cfg_scale_text)
-    cfg_scale_speaker_val = float(cfg_scale_speaker) if cfg_scale_speaker is not None else None
+    cfg_scale_speaker_val = (
+        float(cfg_scale_speaker) if cfg_scale_speaker is not None else None
+    )
     cfg_min_t_val = float(cfg_min_t)
     cfg_max_t_val = float(cfg_max_t)
     truncation_factor_val = float(truncation_factor)
@@ -274,9 +292,15 @@ def generate_audio(
 
     speaker_kv_enabled = bool(force_speaker)
     if speaker_kv_enabled:
-        speaker_kv_scale_val = float(speaker_kv_scale) if speaker_kv_scale is not None else None
-        speaker_kv_min_t_val = float(speaker_kv_min_t) if speaker_kv_min_t is not None else None
-        speaker_kv_max_layers_val = int(speaker_kv_max_layers) if speaker_kv_max_layers is not None else None
+        speaker_kv_scale_val = (
+            float(speaker_kv_scale) if speaker_kv_scale is not None else None
+        )
+        speaker_kv_min_t_val = (
+            float(speaker_kv_min_t) if speaker_kv_min_t is not None else None
+        )
+        speaker_kv_max_layers_val = (
+            int(speaker_kv_max_layers) if speaker_kv_max_layers is not None else None
+        )
     else:
         speaker_kv_scale_val = None
         speaker_kv_min_t_val = None
@@ -284,29 +308,42 @@ def generate_audio(
 
     # Load speaker audio early so we can compute actual lengths for bucket selection
     use_zero_speaker = not speaker_audio_path or speaker_audio_path == ""
-    speaker_audio = load_audio(speaker_audio_path).cuda() if not use_zero_speaker else None
+    speaker_audio = (
+        load_audio(speaker_audio_path).cuda() if not use_zero_speaker else None
+    )
 
     if use_custom_shapes:
         # Compute actual text byte length
-        actual_text_byte_length = len(text_prompt.encode("utf-8")) + 1  # +1 for BOS token
-        
+        actual_text_byte_length = (
+            len(text_prompt.encode("utf-8")) + 1
+        )  # +1 for BOS token
+
         # Compute actual speaker latent length (audio_samples // 2048)
         AE_DOWNSAMPLE_FACTOR = 2048
         if speaker_audio is not None:
-            actual_speaker_latent_length = (speaker_audio.shape[-1] // AE_DOWNSAMPLE_FACTOR) // 4 * 4
+            actual_speaker_latent_length = (
+                (speaker_audio.shape[-1] // AE_DOWNSAMPLE_FACTOR) // 4 * 4
+            )
         else:
             actual_speaker_latent_length = 0
-        
+
         # Find appropriate bucket sizes from comma-separated values
-        pad_to_max_text_length = find_min_bucket_gte(max_text_byte_length, actual_text_byte_length)
-        pad_to_max_speaker_latent_length = find_min_bucket_gte(max_speaker_latent_length, actual_speaker_latent_length)
-        sample_latent_length_val = int(sample_latent_length) if sample_latent_length.strip() else (DEFAULT_SAMPLE_LATENT_LENGTH or 640)
+        pad_to_max_text_length = find_min_bucket_gte(
+            max_text_byte_length, actual_text_byte_length
+        )
+        pad_to_max_speaker_latent_length = find_min_bucket_gte(
+            max_speaker_latent_length, actual_speaker_latent_length
+        )
+        sample_latent_length_val = (
+            int(sample_latent_length)
+            if sample_latent_length.strip()
+            else (DEFAULT_SAMPLE_LATENT_LENGTH or 640)
+        )
     else:
         pad_to_max_text_length = None
         pad_to_max_speaker_latent_length = None
         sample_latent_length_val = DEFAULT_SAMPLE_LATENT_LENGTH or 640
 
-    
     sample_fn = partial(
         sample_euler_cfg_independent_guidances,
         num_steps=num_steps_int,
@@ -339,7 +376,9 @@ def generate_audio(
     audio_to_save = audio_out[0].cpu()
 
     stem = make_stem("generated", session_id)
-    output_path = save_audio_with_format(audio_to_save, TEMP_AUDIO_DIR, stem, 44100, audio_format)
+    output_path = save_audio_with_format(
+        audio_to_save, TEMP_AUDIO_DIR, stem, 44100, audio_format
+    )
 
     generation_time = time.time() - start_time
     time_str = f"⏱️ Total generation time: {generation_time:.2f}s"
@@ -353,26 +392,37 @@ def generate_audio(
             fish_ae=fish_ae,
             pca_state=pca_state,
             audio=torch.nn.functional.pad(
-                speaker_audio[..., :2048 * 640],
+                speaker_audio[..., : 2048 * 640],
                 (0, max(0, 2048 * 640 - speaker_audio.shape[-1])),
             )[None],
         )[..., : speaker_audio.shape[-1]]
 
         recon_stem = make_stem("speaker_recon", session_id)
-        recon_output_path = save_audio_with_format(audio_recon.cpu()[0], TEMP_AUDIO_DIR, recon_stem, 44100, audio_format)
+        recon_output_path = save_audio_with_format(
+            audio_recon.cpu()[0], TEMP_AUDIO_DIR, recon_stem, 44100, audio_format
+        )
 
     if show_original_audio and speaker_audio is not None:
         original_stem = make_stem("original_audio", session_id)
-        original_output_path = save_audio_with_format(speaker_audio.cpu(), TEMP_AUDIO_DIR, original_stem, 44100, audio_format)
+        original_output_path = save_audio_with_format(
+            speaker_audio.cpu(), TEMP_AUDIO_DIR, original_stem, 44100, audio_format
+        )
 
-    show_reference_section = (show_original_audio or reconstruct_first_30_seconds) and speaker_audio is not None
+    show_reference_section = (
+        show_original_audio or reconstruct_first_30_seconds
+    ) and speaker_audio is not None
     return (
         gr.update(),
         gr.update(value=str(output_path), visible=True),
         gr.update(value=text_display, visible=True),
-        gr.update(value=str(original_output_path) if original_output_path else None, visible=True),
+        gr.update(
+            value=str(original_output_path) if original_output_path else None,
+            visible=True,
+        ),
         gr.update(value=time_str, visible=True),
-        gr.update(value=str(recon_output_path) if recon_output_path else None, visible=True),
+        gr.update(
+            value=str(recon_output_path) if recon_output_path else None, visible=True
+        ),
         gr.update(visible=(show_original_audio and speaker_audio is not None)),
         gr.update(visible=(reconstruct_first_30_seconds and speaker_audio is not None)),
         gr.update(visible=show_reference_section),
@@ -504,7 +554,7 @@ def load_sampler_presets():
             "cfg_max_t": "1.0",
             "truncation_factor": "1.",
             "rescale_k": "1.",
-            "rescale_sigma": "3.0"
+            "rescale_sigma": "3.0",
         }
     }
     with open(SAMPLER_PRESETS_PATH, "w") as f:
@@ -552,13 +602,20 @@ def get_audio_prompt_files(search_query: str = ""):
     if AUDIO_PROMPT_FOLDER is None or not AUDIO_PROMPT_FOLDER.exists():
         return []
 
-    files = sorted([f.name for f in AUDIO_PROMPT_FOLDER.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS], key=str.lower)
-    
+    files = sorted(
+        [
+            f.name
+            for f in AUDIO_PROMPT_FOLDER.iterdir()
+            if f.is_file() and f.suffix.lower() in AUDIO_EXTS
+        ],
+        key=str.lower,
+    )
+
     # Filter by search query if provided
     if search_query.strip():
         query_lower = search_query.lower()
         files = [f for f in files if query_lower in f.lower()]
-    
+
     return [[file] for file in files]
 
 
@@ -645,11 +702,17 @@ def init_session():
 
 with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
     gr.Markdown("# Echo-TTS")
-    gr.Markdown("*Jordan Darefsky, 2025. See technical details [here](https://jordandarefsky.com/blog/2025/echo/)*")
+    gr.Markdown(
+        "*Jordan Darefsky, 2025. See technical details [here](https://jordandarefsky.com/blog/2025/echo/)*"
+    )
 
-    gr.Markdown("**License Notice:** All audio outputs are subject to non-commercial use [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).")
+    gr.Markdown(
+        "**License Notice:** All audio outputs are subject to non-commercial use [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)."
+    )
 
-    gr.Markdown("**Responsible Use:** Do not use this model to impersonate real people without their explicit consent or to generate deceptive audio.")
+    gr.Markdown(
+        "**Responsible Use:** Do not use this model to impersonate real people without their explicit consent or to generate deceptive audio."
+    )
 
     with gr.Accordion("📖 Quick Start Instructions", open=True):
         gr.Markdown(
@@ -710,8 +773,16 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
         )
         lora_checkpoint = gr.Textbox(
             label="LoRA Checkpoint Path",
-            placeholder="./checkpoints/lora_best.pt",
+            placeholder="/content/drive/MyDrive/lora_best_2.pt",
             lines=1,
+        )
+        lora_strength = gr.Slider(
+            minimum=0.0,
+            maximum=3.0,
+            value=1.0,
+            step=0.05,
+            label="LoRA Strength",
+            info="Control the strength of the LoRA adaptation (0.0 = no effect, 1.0 = full strength, >1.0 = amplified)",
         )
         lora_status = gr.Markdown("ℹ️ Using base model (no LoRA)", visible=True)
 
@@ -727,7 +798,9 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             interactive=False,
             column_widths=["12%", "6%", "82%"],
         )
-    text_prompt = gr.Textbox(label="Text Prompt", placeholder="[S1] Enter your text prompt here...", lines=4)
+    text_prompt = gr.Textbox(
+        label="Text Prompt", placeholder="[S1] Enter your text prompt here...", lines=4
+    )
 
     gr.HTML('<hr class="section-separator">')
     gr.Markdown("# Generation")
@@ -772,7 +845,9 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                 )
 
             with gr.Column(scale=0.8, min_width=100):
-                rng_seed = gr.Number(label="RNG Seed", value=0, info="Seed for noise", precision=0)
+                rng_seed = gr.Number(
+                    label="RNG Seed", value=0, info="Seed for noise", precision=0
+                )
 
             with gr.Column(scale=3):
                 with gr.Group():
@@ -783,15 +858,25 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                     </div>
                     """
                     )
-                    spk_kv_preset_enable = gr.Button("", elem_id="spk_kv_enable", elem_classes=["proxy-btn"])
-                    spk_kv_preset_off = gr.Button("", elem_id="spk_kv_off", elem_classes=["proxy-btn"])
+                    spk_kv_preset_enable = gr.Button(
+                        "", elem_id="spk_kv_enable", elem_classes=["proxy-btn"]
+                    )
+                    spk_kv_preset_off = gr.Button(
+                        "", elem_id="spk_kv_off", elem_classes=["proxy-btn"]
+                    )
                     force_speaker = gr.Checkbox(
                         label='"Force Speaker" (KV scaling)',
                         value=False,
                         info="Enable to more strongly match the reference speaker (though higher values may degrade quality)",
                     )
                     with gr.Row(visible=False) as speaker_kv_row:
-                        speaker_kv_scale = gr.Number(label="KV Scale", value=1.5, info="Scale factor (>1 -> larger effect; try 1.5, 1.2, ...)", minimum=0, step=0.1)
+                        speaker_kv_scale = gr.Number(
+                            label="KV Scale",
+                            value=1.5,
+                            info="Scale factor (>1 -> larger effect; try 1.5, 1.2, ...)",
+                            minimum=0,
+                            step=0.1,
+                        )
                         speaker_kv_min_t = gr.Number(
                             label="KV Min t",
                             value=0.9,
@@ -857,9 +942,15 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                         </div>
                         """
                         )
-                        trunc_preset_flat = gr.Button("", elem_id="trunc_flat", elem_classes=["proxy-btn"])
-                        trunc_preset_sharp = gr.Button("", elem_id="trunc_sharp", elem_classes=["proxy-btn"])
-                        trunc_preset_baseline = gr.Button("", elem_id="trunc_baseline", elem_classes=["proxy-btn"])
+                        trunc_preset_flat = gr.Button(
+                            "", elem_id="trunc_flat", elem_classes=["proxy-btn"]
+                        )
+                        trunc_preset_sharp = gr.Button(
+                            "", elem_id="trunc_sharp", elem_classes=["proxy-btn"]
+                        )
+                        trunc_preset_baseline = gr.Button(
+                            "", elem_id="trunc_baseline", elem_classes=["proxy-btn"]
+                        )
                         with gr.Row():
                             truncation_factor = gr.Number(
                                 label="Truncation Factor",
@@ -869,10 +960,18 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                                 step=0.05,
                             )
                             rescale_k = gr.Number(
-                                label="Rescale k", value=1.2, info="<1=sharpen, >1=flatten, 1=off", minimum=0, step=0.05
+                                label="Rescale k",
+                                value=1.2,
+                                info="<1=sharpen, >1=flatten, 1=off",
+                                minimum=0,
+                                step=0.05,
                             )
                             rescale_sigma = gr.Number(
-                                label="Rescale σ", value=3.0, info="Sigma parameter", minimum=0, step=0.1
+                                label="Rescale σ",
+                                value=3.0,
+                                info="Sigma parameter",
+                                minimum=0,
+                                step=0.1,
                             )
 
                 with gr.Column(scale=1):
@@ -888,11 +987,19 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                         </div>
                         """
                         )
-                        cfg_preset_higher_speaker = gr.Button("", elem_id="cfg_higher", elem_classes=["proxy-btn"])
-                        cfg_preset_large_guidances = gr.Button("", elem_id="cfg_large", elem_classes=["proxy-btn"])
+                        cfg_preset_higher_speaker = gr.Button(
+                            "", elem_id="cfg_higher", elem_classes=["proxy-btn"]
+                        )
+                        cfg_preset_large_guidances = gr.Button(
+                            "", elem_id="cfg_large", elem_classes=["proxy-btn"]
+                        )
                         with gr.Row():
                             cfg_scale_text = gr.Number(
-                                label="Text CFG Scale", value=3.0, info="Guidance strength for text", minimum=0, step=0.5
+                                label="Text CFG Scale",
+                                value=3.0,
+                                info="Guidance strength for text",
+                                minimum=0,
+                                step=0.5,
                             )
                             cfg_scale_speaker = gr.Number(
                                 label="Speaker CFG Scale",
@@ -904,19 +1011,37 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
 
                         with gr.Row():
                             cfg_min_t = gr.Number(
-                                label="CFG Min t", value=0.5, info="(0-1), CFG applied when t >= val", minimum=0, maximum=1, step=0.05
+                                label="CFG Min t",
+                                value=0.5,
+                                info="(0-1), CFG applied when t >= val",
+                                minimum=0,
+                                maximum=1,
+                                step=0.05,
                             )
                             cfg_max_t = gr.Number(
-                                label="CFG Max t", value=1.0, info="(0-1), CFG applied when t <= val", minimum=0, maximum=1, step=0.05
+                                label="CFG Max t",
+                                value=1.0,
+                                info="(0-1), CFG applied when t <= val",
+                                minimum=0,
+                                maximum=1,
+                                step=0.05,
                             )
 
     with gr.Row(equal_height=True):
-        audio_format = gr.Radio(choices=["wav", "mp3"], value="wav", label="Format", scale=1, min_width=90)
-        generate_btn = gr.Button("Generate Audio", variant="primary", size="lg", scale=10)
+        audio_format = gr.Radio(
+            choices=["wav", "mp3"], value="wav", label="Format", scale=1, min_width=90
+        )
+        generate_btn = gr.Button(
+            "Generate Audio", variant="primary", size="lg", scale=10
+        )
         with gr.Column(scale=1):
-            show_original_audio = gr.Checkbox(label="Re-display Original Audio (full 5-minute cropped mono)", value=False)
+            show_original_audio = gr.Checkbox(
+                label="Re-display Original Audio (full 5-minute cropped mono)",
+                value=False,
+            )
             reconstruct_first_30_seconds = gr.Checkbox(
-                label="Show Autoencoder Reconstruction (only first 30s of reference)", value=False
+                label="Show Autoencoder Reconstruction (only first 30s of reference)",
+                value=False,
             )
 
     gr.HTML('<hr class="section-separator">')
@@ -929,22 +1054,42 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
         gr.Markdown("---")
         reference_audio_header = gr.Markdown("#### Reference Audio", visible=False)
 
-        with gr.Accordion("Original Audio (5 min Cropped Mono)", open=False, visible=False) as original_accordion:
-            original_audio = gr.Audio(label="Original Reference Audio (5 min)", visible=True)
+        with gr.Accordion(
+            "Original Audio (5 min Cropped Mono)", open=False, visible=False
+        ) as original_accordion:
+            original_audio = gr.Audio(
+                label="Original Reference Audio (5 min)", visible=True
+            )
 
-        with gr.Accordion("Autoencoder Reconstruction of First 30s of Reference", open=False, visible=False) as reference_accordion:
-            reference_audio = gr.Audio(label="Decoded Reference Audio (30s)", visible=True)
+        with gr.Accordion(
+            "Autoencoder Reconstruction of First 30s of Reference",
+            open=False,
+            visible=False,
+        ) as reference_accordion:
+            reference_audio = gr.Audio(
+                label="Decoded Reference Audio (30s)", visible=True
+            )
 
     # Event handlers
     if AUDIO_PROMPT_FOLDER is not None and AUDIO_PROMPT_FOLDER.exists():
-        audio_prompt_table.select(select_audio_prompt_file, outputs=[custom_audio_input])
-        audio_prompt_search.change(filter_audio_prompts, inputs=[audio_prompt_search], outputs=[audio_prompt_table])
+        audio_prompt_table.select(
+            select_audio_prompt_file, outputs=[custom_audio_input]
+        )
+        audio_prompt_search.change(
+            filter_audio_prompts,
+            inputs=[audio_prompt_search],
+            outputs=[audio_prompt_table],
+        )
 
     text_presets_table.select(select_text_preset, outputs=text_prompt)
 
-    mode_selector.change(toggle_mode, inputs=[mode_selector], outputs=[advanced_mode_column])
+    mode_selector.change(
+        toggle_mode, inputs=[mode_selector], outputs=[advanced_mode_column]
+    )
 
-    force_speaker.change(update_force_row, inputs=[force_speaker], outputs=[speaker_kv_row])
+    force_speaker.change(
+        update_force_row, inputs=[force_speaker], outputs=[speaker_kv_row]
+    )
 
     def toggle_custom_shapes(enabled):
         return gr.update(visible=enabled)
@@ -959,8 +1104,8 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
         """When compile is enabled, force custom shapes to be enabled."""
         if compile_enabled:
             return (
-                gr.update(value=True),   # use_custom_shapes_checkbox
-                gr.update(visible=True), # custom_shapes_row
+                gr.update(value=True),  # use_custom_shapes_checkbox
+                gr.update(visible=True),  # custom_shapes_row
             )
         return (
             gr.update(),
@@ -974,19 +1119,46 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
     )
 
     cfg_preset_higher_speaker.click(
-        lambda: apply_cfg_preset("higher speaker"), outputs=[cfg_scale_text, cfg_scale_speaker, cfg_min_t, cfg_max_t, preset_dropdown]
+        lambda: apply_cfg_preset("higher speaker"),
+        outputs=[
+            cfg_scale_text,
+            cfg_scale_speaker,
+            cfg_min_t,
+            cfg_max_t,
+            preset_dropdown,
+        ],
     )
     cfg_preset_large_guidances.click(
-        lambda: apply_cfg_preset("large guidances"), outputs=[cfg_scale_text, cfg_scale_speaker, cfg_min_t, cfg_max_t, preset_dropdown]
+        lambda: apply_cfg_preset("large guidances"),
+        outputs=[
+            cfg_scale_text,
+            cfg_scale_speaker,
+            cfg_min_t,
+            cfg_max_t,
+            preset_dropdown,
+        ],
     )
 
-    spk_kv_preset_enable.click(lambda: apply_speaker_kv_preset("enable"), outputs=[force_speaker, speaker_kv_row, preset_dropdown])
-    spk_kv_preset_off.click(lambda: apply_speaker_kv_preset("off"), outputs=[force_speaker, speaker_kv_row, preset_dropdown])
+    spk_kv_preset_enable.click(
+        lambda: apply_speaker_kv_preset("enable"),
+        outputs=[force_speaker, speaker_kv_row, preset_dropdown],
+    )
+    spk_kv_preset_off.click(
+        lambda: apply_speaker_kv_preset("off"),
+        outputs=[force_speaker, speaker_kv_row, preset_dropdown],
+    )
 
-    trunc_preset_flat.click(lambda: apply_truncation_preset("flat"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown])
-    trunc_preset_sharp.click(lambda: apply_truncation_preset("sharp"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown])
+    trunc_preset_flat.click(
+        lambda: apply_truncation_preset("flat"),
+        outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown],
+    )
+    trunc_preset_sharp.click(
+        lambda: apply_truncation_preset("sharp"),
+        outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown],
+    )
     trunc_preset_baseline.click(
-        lambda: apply_truncation_preset("baseline(sharp)"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown]
+        lambda: apply_truncation_preset("baseline(sharp)"),
+        outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown],
     )
 
     preset_dropdown.change(
@@ -1036,6 +1208,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             compile_checkbox,
             show_original_audio,
             lora_checkpoint,
+            lora_strength,
             session_id_state,
         ],
         outputs=[
@@ -1077,9 +1250,9 @@ if __name__ == "__main__":
     share = os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes")
 
     if share:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("🌐 Creating public shareable URL...")
-        print("="*60)
+        print("=" * 60)
 
     demo.launch(
         allowed_paths=[str(AUDIO_PROMPT_FOLDER)],
