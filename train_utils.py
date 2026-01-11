@@ -15,26 +15,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from model import EchoDiT
 from autoencoder import DAC
 from inference import (
     PCAState,
-    ae_encode,
     ae_decode,
+    ae_encode,
     get_speaker_latent_and_mask,
     get_text_input_ids_and_mask,
 )
-
+from model import EchoDiT
 
 # ============================================================================
 # Data Loading
 # ============================================================================
 
+
 @dataclass
 class TrainingSample:
     """A single training sample with audio, text, and optional speaker reference."""
+
     audio_path: str
     text: str
     speaker_audio_path: Optional[str] = None  # If None, uses same audio as speaker ref
@@ -155,7 +156,9 @@ class EchoTTSDataset(Dataset):
         if cache_latents:
             self._precompute_latents()
 
-    def _load_audio_segment(self, audio_path: str, sample_rate: int = 44100) -> torch.Tensor:
+    def _load_audio_segment(
+        self, audio_path: str, sample_rate: int = 44100
+    ) -> torch.Tensor:
         """
         Load audio segment, handling both regular paths and segmented paths.
 
@@ -211,7 +214,9 @@ class EchoTTSDataset(Dataset):
 
                 # Calculate max audio duration based on max_latent_length
                 # Each latent frame = ~46.67ms of audio at 44.1kHz
-                max_audio_duration = (self.max_latent_length * 46.67) / 1000.0  # Convert to seconds
+                max_audio_duration = (
+                    self.max_latent_length * 46.67
+                ) / 1000.0  # Convert to seconds
                 max_samples = int(max_audio_duration * 44100)
 
                 # Truncate if still too long (shouldn't happen with 25s chunks)
@@ -223,7 +228,7 @@ class EchoTTSDataset(Dataset):
                 with torch.no_grad():
                     latent = ae_encode(self.fish_ae, self.pca_state, audio)
                     # Truncate to max length (safety check)
-                    latent = latent[:, :self.max_latent_length, :]
+                    latent = latent[:, : self.max_latent_length, :]
 
                 self.latent_cache[sample.audio_path] = latent.cpu()
 
@@ -231,7 +236,11 @@ class EchoTTSDataset(Dataset):
             speaker_path = sample.speaker_audio_path or sample.audio_path
 
             # Remove segment identifier for speaker reference
-            base_speaker_path = speaker_path.split("#segment_")[0] if "#segment_" in speaker_path else speaker_path
+            base_speaker_path = (
+                speaker_path.split("#segment_")[0]
+                if "#segment_" in speaker_path
+                else speaker_path
+            )
 
             if base_speaker_path not in self.speaker_cache:
                 audio = load_audio_tensor(base_speaker_path, max_duration=30.0)
@@ -252,7 +261,9 @@ class EchoTTSDataset(Dataset):
             if (i + 1) % 10 == 0:
                 print(f"  Encoded {i + 1}/{len(self.samples)} samples")
 
-        print(f"Done! Cached {len(self.latent_cache)} latents, {len(self.speaker_cache)} speakers")
+        print(
+            f"Done! Cached {len(self.latent_cache)} latents, {len(self.speaker_cache)} speakers"
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -268,12 +279,16 @@ class EchoTTSDataset(Dataset):
             audio = audio.unsqueeze(0).to(self.fish_ae.dtype).to(self.device)
             with torch.no_grad():
                 latent = ae_encode(self.fish_ae, self.pca_state, audio)
-                latent = latent[:, :self.max_latent_length, :]
+                latent = latent[:, : self.max_latent_length, :]
             latent = latent.cpu()
 
         # Get speaker latent (use base path without segment identifier)
         speaker_path = sample.speaker_audio_path or sample.audio_path
-        base_speaker_path = speaker_path.split("#segment_")[0] if "#segment_" in speaker_path else speaker_path
+        base_speaker_path = (
+            speaker_path.split("#segment_")[0]
+            if "#segment_" in speaker_path
+            else speaker_path
+        )
 
         if self.cache_latents:
             speaker_latent, speaker_mask = self.speaker_cache[base_speaker_path]
@@ -337,6 +352,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 # Loss Function
 # ============================================================================
 
+
 def compute_diffusion_loss(
     model: EchoDiT,
     latent_target: torch.Tensor,
@@ -373,7 +389,7 @@ def compute_diffusion_loss(
     dtype = model.dtype
 
     # Sample random timesteps uniformly in [min_t, max_t]
-    t = torch.rand(B, device=device) * (max_t - min_t) + min_t
+    t = torch.rand(B, device=device) ** 2.0
 
     # Generate noise
     noise = torch.randn_like(latent_target)
@@ -399,12 +415,19 @@ def compute_diffusion_loss(
         kv_cache_text=kv_cache_text,
         kv_cache_speaker=kv_cache_speaker,
     )
-
-    # Compute MSE loss, masked to valid positions
+    # Per-element MSE
     loss = F.mse_loss(v_pred.float(), v_target.float(), reduction="none")
 
-    # Apply mask and average
+    # Temporal weighting (front-loaded)
+    time_weights = torch.linspace(1.4, 0.8, T, device=loss.device)
+    loss = loss * time_weights[None, :, None]
+
+    # Apply latent mask
     loss = loss * latent_mask.unsqueeze(-1).float()
+
+    # Stable normalization
+    num_valid = latent_mask.sum() * loss.shape[-1]
+    loss = loss.sum() / torch.clamp(num_valid, min=1)
 
     # More numerically stable averaging
     num_valid_elements = latent_mask.sum() * D
@@ -425,6 +448,7 @@ def compute_diffusion_loss(
 # ============================================================================
 # Training Loop
 # ============================================================================
+
 
 def training_step(
     model: EchoDiT,
@@ -453,7 +477,7 @@ def training_step(
         batch["text"],
         max_length=None,
         device=device,
-        normalize=True,
+        normalize=False,
     )
 
     # Compute loss
@@ -477,7 +501,7 @@ def train_epoch(
     scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
     device: str = "cuda",
     gradient_accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
+    max_grad_norm: float = 0.4,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> float:
     """
@@ -504,7 +528,9 @@ def train_epoch(
 
     for step, batch in enumerate(dataloader):
         # Mixed precision forward - use new API
-        with torch.amp.autocast('cuda', enabled=scaler is not None, dtype=torch.bfloat16):
+        with torch.amp.autocast(
+            "cuda", enabled=scaler is not None, dtype=torch.bfloat16
+        ):
             loss = training_step(model, batch, device)
 
             # Check for NaN before scaling
@@ -529,10 +555,14 @@ def train_epoch(
                 scaler.unscale_(optimizer)
 
                 # Check gradients for NaN
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm
+                )
 
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"Warning: NaN/Inf gradient norm detected at step {step}, skipping update")
+                    print(
+                        f"Warning: NaN/Inf gradient norm detected at step {step}, skipping update"
+                    )
                     optimizer.zero_grad()
                     scaler.update()
                     continue
@@ -540,10 +570,14 @@ def train_epoch(
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm
+                )
 
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"Warning: NaN/Inf gradient norm detected at step {step}, skipping update")
+                    print(
+                        f"Warning: NaN/Inf gradient norm detected at step {step}, skipping update"
+                    )
                     optimizer.zero_grad()
                     continue
 
@@ -582,6 +616,7 @@ def get_cosine_schedule_with_warmup(
 # Transcription (Whisper)
 # ============================================================================
 
+
 def transcribe_audio_whisper(
     audio_path: str,
     model_name: str = "base",
@@ -601,9 +636,7 @@ def transcribe_audio_whisper(
     try:
         import whisper
     except ImportError:
-        raise ImportError(
-            "Please install whisper: pip install openai-whisper"
-        )
+        raise ImportError("Please install whisper: pip install openai-whisper")
 
     model = whisper.load_model(model_name)
     result = model.transcribe(audio_path, language=language)
@@ -636,9 +669,7 @@ def transcribe_audio_files(
     try:
         import whisper
     except ImportError:
-        raise ImportError(
-            "Please install whisper: pip install openai-whisper"
-        )
+        raise ImportError("Please install whisper: pip install openai-whisper")
 
     print(f"Loading Whisper model '{model_name}'...")
     model = whisper.load_model(model_name)
@@ -692,13 +723,13 @@ def transcribe_audio_files_parakeet(
         import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
     except ImportError:
-        raise ImportError(
-            "Please install: pip install transformers accelerate"
-        )
+        raise ImportError("Please install: pip install transformers accelerate")
 
     print(f"Transcribing {len(audio_paths)} files with Parakeet...")
     print(f"Loading model '{model_name}' (faster than Whisper!)...")
-    print(f"Chunking long audio into {chunk_duration}s segments with {overlap*100:.0f}% overlap\n")
+    print(
+        f"Chunking long audio into {chunk_duration}s segments with {overlap * 100:.0f}% overlap\n"
+    )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -720,6 +751,7 @@ def transcribe_audio_files_parakeet(
         try:
             # Load and preprocess audio (FULL FILE)
             import torchaudio
+
             audio, sr = torchaudio.load(path)
 
             # Convert to mono if needed
@@ -754,9 +786,7 @@ def transcribe_audio_files_parakeet(
             for chunk_idx, chunk in enumerate(chunks):
                 # Process with Parakeet
                 inputs = processor(
-                    chunk.squeeze().numpy(),
-                    sampling_rate=16000,
-                    return_tensors="pt"
+                    chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt"
                 )
                 inputs = {k: v.to(device).to(torch_dtype) for k, v in inputs.items()}
 
@@ -764,10 +794,9 @@ def transcribe_audio_files_parakeet(
                 with torch.no_grad():
                     generated_ids = model.generate(**inputs)
 
-                text = processor.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True
-                )[0].strip()
+                text = processor.batch_decode(generated_ids, skip_special_tokens=True)[
+                    0
+                ].strip()
 
                 if text:  # Only add non-empty transcriptions
                     # Add speaker prefix if not present
@@ -780,7 +809,9 @@ def transcribe_audio_files_parakeet(
 
             # Show chunk count for this file
             duration_sec = total_samples / sr
-            print(f"  {os.path.basename(path)}: {duration_sec:.1f}s -> {len(chunks)} segments")
+            print(
+                f"  {os.path.basename(path)}: {duration_sec:.1f}s -> {len(chunks)} segments"
+            )
 
         except Exception as e:
             errors.append((path, str(e)))
@@ -790,11 +821,11 @@ def transcribe_audio_files_parakeet(
         if (i + 1) % batch_size == 0 or (i + 1) == len(audio_paths):
             print(f"\nProgress: {i + 1}/{len(audio_paths)} files transcribed\n")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Transcription complete!")
     print(f"  Successful: {len(transcriptions)}")
     print(f"  Errors: {len(errors)}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     if errors:
         print("\nFiles with errors:")
@@ -829,9 +860,7 @@ def transcribe_audio_files_parallel(
     try:
         import whisper
     except ImportError:
-        raise ImportError(
-            "Please install whisper: pip install openai-whisper"
-        )
+        raise ImportError("Please install whisper: pip install openai-whisper")
 
     print(f"Transcribing {len(audio_paths)} files with Whisper '{model_name}'...")
     print(f"Loading model (this may take a minute for large-v3)...\n")
@@ -861,11 +890,11 @@ def transcribe_audio_files_parallel(
         if (i + 1) % batch_size == 0 or (i + 1) == len(audio_paths):
             print(f"Progress: {i + 1}/{len(audio_paths)} files transcribed")
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Transcription complete!")
     print(f"  Successful: {len(transcriptions)}")
     print(f"  Errors: {len(errors)}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     if errors:
         print("\nFiles with errors:")
@@ -878,6 +907,7 @@ def transcribe_audio_files_parallel(
 # ============================================================================
 # Utilities
 # ============================================================================
+
 
 def prepare_samples_from_directory(
     audio_dir: str,
@@ -918,11 +948,13 @@ def prepare_samples_from_directory(
             text = None  # Will need to be transcribed
 
         if text is not None:
-            samples.append(TrainingSample(
-                audio_path=path_str,
-                text=text,
-                speaker_audio_path=None,  # Use same audio as speaker ref
-            ))
+            samples.append(
+                TrainingSample(
+                    audio_path=path_str,
+                    text=text,
+                    speaker_audio_path=None,  # Use same audio as speaker ref
+                )
+            )
 
     return samples
 
