@@ -196,6 +196,7 @@ def load_lora_model(
         # Reload base model fresh
         model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
 
+        model = model.to_empty(device="cuda")
         # Apply LoRA structure with strength-scaled alpha
         base_alpha = config.get("alpha", 32.0)
         scaled_alpha = base_alpha * lora_strength
