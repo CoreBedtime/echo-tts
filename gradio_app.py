@@ -60,7 +60,6 @@ TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 # Model loading (eager for local use)
 # NOTE: delete_blockwise_modules=False keeps the latent_encoder for controllable rhythm/timing
 base_model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=False)
-base_model.latent_encoder = base_model.latent_encoder.to(dtype=MODEL_DTYPE)
 fish_ae = load_fish_ae_from_hf(dtype=FISH_AE_DTYPE)
 pca_state = load_pca_state_from_hf()
 
