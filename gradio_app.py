@@ -167,13 +167,20 @@ def find_min_bucket_gte(values_str: str, actual_length: int) -> int | None:
 
 
 def load_lora_model(
-    lora_path: str | None, lora_strength: float = 1.0
+    lora_path: str | None,
+    lora_strength: float = 1.0,
+    lora_rank: int | None = None,
+    lora_alpha: float | None = None,
+    lora_dropout: float = 0.0,
 ) -> Tuple[Any, str]:
     """Load LoRA checkpoint and apply to model.
 
     Args:
         lora_path: Path to LoRA checkpoint file
         lora_strength: Scaling factor for LoRA strength (0.0 to 2.0)
+        lora_rank: Override rank from checkpoint (None = use checkpoint value)
+        lora_alpha: Override alpha from checkpoint (None = use checkpoint value scaled by strength)
+        lora_dropout: Dropout probability for LoRA layers (0.0 = no dropout)
 
     Returns:
         Tuple of (model_with_lora, status_message)
@@ -194,15 +201,21 @@ def load_lora_model(
         # Reload base model fresh
         model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
 
-        # Apply LoRA structure with strength-scaled alpha
+        # Use provided rank or fall back to checkpoint config
+        rank = lora_rank if lora_rank is not None else config.get("rank", 32)
+
+        # Use provided alpha or scale checkpoint alpha by strength
         base_alpha = config.get("alpha", 32.0)
-        scaled_alpha = base_alpha * lora_strength
+        if lora_alpha is not None:
+            alpha = lora_alpha * lora_strength
+        else:
+            alpha = base_alpha * lora_strength
 
         model, _ = apply_lora_to_model(
             model,
-            rank=config.get("rank", 32),
-            alpha=scaled_alpha,
-            dropout=0.0,  # No dropout for inference
+            rank=rank,
+            alpha=alpha,
+            dropout=lora_dropout,
             target_modules=config.get("target_modules", []),
         )
 
@@ -216,7 +229,10 @@ def load_lora_model(
         current_lora_path = lora_path
         lora_name = Path(lora_path).name
 
-        return model, f"✅ Loaded LoRA: {lora_name} (strength: {lora_strength:.2f})"
+        return (
+            model,
+            f"✅ Loaded LoRA: {lora_name} (rank: {rank}, alpha: {alpha:.1f}, strength: {lora_strength:.2f}, dropout: {lora_dropout:.2f})",
+        )
 
     except Exception as e:
         # On error, revert to base model
@@ -252,13 +268,22 @@ def generate_audio(
     show_original_audio: bool,
     lora_checkpoint_path: str,
     lora_strength: float,
+    lora_rank: int | None,
+    lora_alpha: float | None,
+    lora_dropout: float,
     session_id: str,
 ) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     """Generate audio using the model."""
     global model_compiled, fish_ae_compiled, model
 
     # Load LoRA if provided
-    model, lora_status = load_lora_model(lora_checkpoint_path, lora_strength)
+    model, lora_status = load_lora_model(
+        lora_checkpoint_path,
+        lora_strength,
+        lora_rank,
+        lora_alpha,
+        lora_dropout,
+    )
 
     if use_compile:
         if model_compiled is None:
@@ -784,6 +809,32 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             label="LoRA Strength",
             info="Control the strength of the LoRA adaptation (0.0 = no effect, 1.0 = full strength, >1.0 = amplified)",
         )
+        with gr.Row():
+            lora_rank = gr.Number(
+                label="LoRA Rank",
+                value=32,
+                info="LoRA rank (None = use checkpoint value, lower = fewer params)",
+                minimum=1,
+                maximum=512,
+                step=1,
+                precision=0,
+            )
+            lora_alpha = gr.Number(
+                label="LoRA Alpha (override)",
+                value=None,
+                info="LoRA alpha override (None = use checkpoint value * strength)",
+                minimum=0.0,
+                maximum=512.0,
+                step=1.0,
+            )
+        lora_dropout = gr.Slider(
+            minimum=0.0,
+            maximum=0.5,
+            value=0.0,
+            step=0.05,
+            label="LoRA Dropout",
+            info="Dropout probability for LoRA layers (0.0 = no dropout, higher = more regularization)",
+        )
         lora_status = gr.Markdown("ℹ️ Using base model (no LoRA)", visible=True)
 
     gr.HTML('<hr class="section-separator">')
@@ -1209,6 +1260,9 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             show_original_audio,
             lora_checkpoint,
             lora_strength,
+            lora_rank,
+            lora_alpha,
+            lora_dropout,
             session_id_state,
         ],
         outputs=[
