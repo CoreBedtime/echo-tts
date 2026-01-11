@@ -453,7 +453,7 @@ def training_step(
         batch["text"],
         max_length=None,
         device=device,
-        normalize=True,
+        normalize=False,
     )
 
     # Compute loss
