@@ -251,6 +251,39 @@ SampleFn = Callable[
 ]
 
 @torch.inference_mode()
+def get_content_latent(
+    fish_ae: DAC,
+    pca_state: PCAState,
+    content_audio: torch.Tensor,
+    max_content_latent_length: int = 640,
+) -> torch.Tensor:
+    """
+    Encode content/rhythm reference audio to latent for timing control.
+
+    Args:
+        fish_ae: Fish-S1-DAC autoencoder
+        pca_state: PCA transformation state
+        content_audio: Audio tensor (1, samples) for rhythm/timing reference
+        max_content_latent_length: Maximum latent length (640 = ~30 seconds)
+
+    Returns:
+        Content latent tensor (1, seq_len, 80) for rhythm conditioning
+    """
+    device = fish_ae.device if hasattr(fish_ae, 'device') else next(fish_ae.parameters()).device
+
+    # Truncate to max length
+    AE_DOWNSAMPLE_FACTOR = 2048
+    max_audio_samples = max_content_latent_length * AE_DOWNSAMPLE_FACTOR
+    content_audio = content_audio[:, :max_audio_samples]
+
+    # Encode to latent
+    content_audio = content_audio.unsqueeze(0).to(fish_ae.dtype).to(device)
+    content_latent = ae_encode(fish_ae, pca_state, content_audio)
+
+    return content_latent
+
+
+@torch.inference_mode()
 def sample_pipeline(
     model: EchoDiT,
     fish_ae: DAC,
@@ -262,7 +295,20 @@ def sample_pipeline(
     pad_to_max_speaker_latent_length: int | None = None,
     pad_to_max_text_length: int | None = None,
     normalize_text: bool = True,
+    # Controllable rhythm/timing
+    content_audio: torch.Tensor | None = None,
+    max_content_latent_length: int = 640,
 ) -> Tuple[torch.Tensor, str]:
+    """
+    Full sampling pipeline with optional rhythm/timing control.
+
+    Args:
+        content_audio: Optional audio tensor (1, samples) for rhythm/timing reference.
+                      When provided, the generated audio will follow the rhythm and
+                      pacing of this reference while using the voice from speaker_audio.
+                      This enables "controllable TTS" - same text, different delivery styles.
+        max_content_latent_length: Maximum content latent length (640 = ~30 seconds)
+    """
 
     MAX_SPEAKER_LATENT_LENGTH = 6400 # max seen during training, though maybe can go higher?
     MAX_TEXT_LENGTH = 768
@@ -276,14 +322,24 @@ def sample_pipeline(
         speaker_mask = torch.zeros((1, pad_to_max_speaker_latent_length or 4), device=device, dtype=torch.bool)
     else:
         speaker_latent, speaker_mask = get_speaker_latent_and_mask(
-            fish_ae, 
-            pca_state, 
-            speaker_audio.to(fish_ae.dtype).to(device), 
+            fish_ae,
+            pca_state,
+            speaker_audio.to(fish_ae.dtype).to(device),
             max_speaker_latent_length=pad_to_max_speaker_latent_length or MAX_SPEAKER_LATENT_LENGTH,
             pad_to_max=(pad_to_max_speaker_latent_length is not None)
         )
 
-    latent_out = sample_fn(model, speaker_latent, speaker_mask, text_input_ids, text_mask, rng_seed)
+    # Encode content/rhythm reference if provided
+    content_latent = None
+    if content_audio is not None:
+        content_latent = get_content_latent(
+            fish_ae,
+            pca_state,
+            content_audio.to(fish_ae.dtype).to(device),
+            max_content_latent_length=max_content_latent_length,
+        )
+
+    latent_out = sample_fn(model, speaker_latent, speaker_mask, text_input_ids, text_mask, rng_seed, content_latent=content_latent)
 
     audio_out = ae_decode(fish_ae, pca_state, latent_out)
 
@@ -348,7 +404,19 @@ def sample_euler_cfg_independent_guidances(
     speaker_kv_max_layers: int | None,
     speaker_kv_min_t: float | None,
     sequence_length: int | None = None,
+    # Controllable rhythm/timing via content latent prefix
+    content_latent: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """
+    Euler sampler with independent CFG for text and speaker.
+
+    Args:
+        content_latent: Optional latent from content/rhythm reference audio.
+                       When provided, acts as a timing template - the model will
+                       follow the rhythm/pacing of this audio while using the
+                       speaker identity from speaker_latent.
+                       Shape: (batch, seq_len, 80)
+    """
 
     if sequence_length is None:
         sequence_length = 640 # max sequence length during training
@@ -368,12 +436,28 @@ def sample_euler_cfg_independent_guidances(
     kv_text_cond = model.get_kv_cache_text(text_input_ids, text_mask)
     kv_speaker_cond = model.get_kv_cache_speaker(speaker_latent.to(dtype))
 
+    # Controllable rhythm: encode content latent as prefix conditioning
+    kv_latent_cond = None
+    if content_latent is not None:
+        # Ensure content latent is properly shaped and on correct device/dtype
+        content_latent = content_latent.to(dtype).to(device)
+        # Align to patch size (model uses patch_size=4 for latent encoder)
+        patch_size = 4
+        content_len = (content_latent.shape[1] // patch_size) * patch_size
+        content_latent = content_latent[:, :content_len, :]
+        kv_latent_cond = model.get_kv_cache_latent(content_latent)
+
     if speaker_kv_scale is not None:
         _multiply_kv_cache(kv_speaker_cond, speaker_kv_scale, speaker_kv_max_layers)
 
     # masks prevent decoder from attending to unconds:
     kv_text_full = _concat_kv_caches(kv_text_cond, kv_text_cond, kv_text_cond)
     kv_speaker_full = _concat_kv_caches(kv_speaker_cond, kv_speaker_cond, kv_speaker_cond)
+
+    # For content latent, use same cache for all CFG branches (rhythm should be consistent)
+    kv_latent_full = None
+    if kv_latent_cond is not None:
+        kv_latent_full = _concat_kv_caches(kv_latent_cond, kv_latent_cond, kv_latent_cond)
 
     full_text_mask = torch.cat([text_mask, text_mask_uncond, text_mask], dim=0)
     full_speaker_mask = torch.cat([speaker_mask, speaker_mask, speaker_mask_uncond], dim=0)
@@ -395,6 +479,7 @@ def sample_euler_cfg_independent_guidances(
                 speaker_mask=full_speaker_mask,
                 kv_cache_text=kv_text_full,
                 kv_cache_speaker=kv_speaker_full,
+                kv_cache_latent=kv_latent_full,
             ).float().chunk(3, dim=0)
             v_pred = v_cond + cfg_scale_text * (v_cond - v_uncond_text) + cfg_scale_speaker * (v_cond - v_uncond_speaker) # can also use a single, joint unconditional for fewer NFE
         else:
@@ -405,6 +490,7 @@ def sample_euler_cfg_independent_guidances(
                 speaker_mask=speaker_mask,
                 kv_cache_text=kv_text_cond,
                 kv_cache_speaker=kv_speaker_cond,
+                kv_cache_latent=kv_latent_cond,
             ).float()
 
         # optional temporal score rescaling: https://arxiv.org/pdf/2510.01184

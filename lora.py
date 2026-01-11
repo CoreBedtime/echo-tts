@@ -147,6 +147,9 @@ def apply_lora_to_model(
             # Text cross-attention (affects text-to-audio mapping)
             "blocks.*.attention.wk_text",
             "blocks.*.attention.wv_text",
+            # Latent cross-attention (for controllable rhythm/timing)
+            "blocks.*.attention.wk_latent",
+            "blocks.*.attention.wv_latent",
             # MLP layers (affects feature transformation)
             "blocks.*.mlp.w1",
             "blocks.*.mlp.w2",

@@ -347,6 +347,9 @@ def compute_diffusion_loss(
     speaker_mask: torch.Tensor,
     min_t: float = 0.0,
     max_t: float = 1.0,
+    # Controllable rhythm/timing training
+    content_latent: torch.Tensor | None = None,
+    use_content_conditioning: bool = True,
 ) -> torch.Tensor:
     """
     Compute flow-matching diffusion loss (v-prediction).
@@ -364,6 +367,9 @@ def compute_diffusion_loss(
         speaker_mask: Speaker attention mask (B, S)
         min_t: Minimum timestep for sampling
         max_t: Maximum timestep for sampling
+        content_latent: Optional content/rhythm reference latents (B, C, 80)
+                       If None and use_content_conditioning=True, uses latent_target
+        use_content_conditioning: Whether to use content latent for rhythm training
 
     Returns:
         Scalar loss tensor
@@ -390,6 +396,18 @@ def compute_diffusion_loss(
         kv_cache_text = model.get_kv_cache_text(text_input_ids, text_mask)
         kv_cache_speaker = model.get_kv_cache_speaker(speaker_latent.to(dtype))
 
+        # Controllable rhythm: use content latent for timing conditioning
+        kv_cache_latent = None
+        if use_content_conditioning:
+            # Use target latent as content reference (teaches model to follow timing)
+            # Or use explicit content_latent if provided
+            content_ref = content_latent if content_latent is not None else latent_target
+            # Align to patch size (model uses patch_size=4)
+            patch_size = 4
+            content_len = (content_ref.shape[1] // patch_size) * patch_size
+            content_ref = content_ref[:, :content_len, :].to(dtype)
+            kv_cache_latent = model.get_kv_cache_latent(content_ref)
+
     # Forward pass to predict velocity
     v_pred = model(
         x=x_t.to(dtype),
@@ -398,6 +416,7 @@ def compute_diffusion_loss(
         speaker_mask=speaker_mask,
         kv_cache_text=kv_cache_text,
         kv_cache_speaker=kv_cache_speaker,
+        kv_cache_latent=kv_cache_latent,
     )
 
     # Compute MSE loss, masked to valid positions
@@ -430,6 +449,7 @@ def training_step(
     model: EchoDiT,
     batch: Dict[str, torch.Tensor],
     device: str = "cuda",
+    use_content_conditioning: bool = True,
 ) -> torch.Tensor:
     """
     Single training step.
@@ -438,6 +458,9 @@ def training_step(
         model: EchoDiT model with LoRA adapters
         batch: Batch from dataloader
         device: Device to run on
+        use_content_conditioning: Whether to use content latent for controllable rhythm training.
+                                 When True, the model learns to follow the timing from the
+                                 target audio's latent, enabling rhythm transfer at inference.
 
     Returns:
         Loss tensor
@@ -465,6 +488,7 @@ def training_step(
         text_mask=text_mask,
         speaker_latent=speaker_latent,
         speaker_mask=speaker_mask,
+        use_content_conditioning=use_content_conditioning,
     )
 
     return loss
@@ -479,6 +503,7 @@ def train_epoch(
     gradient_accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    use_content_conditioning: bool = True,
 ) -> float:
     """
     Train for one epoch.
@@ -492,6 +517,7 @@ def train_epoch(
         gradient_accumulation_steps: Accumulate gradients over N steps
         max_grad_norm: Maximum gradient norm for clipping
         scaler: Optional GradScaler for mixed precision
+        use_content_conditioning: Whether to use content latent for controllable rhythm training
 
     Returns:
         Average loss for the epoch
@@ -505,7 +531,7 @@ def train_epoch(
     for step, batch in enumerate(dataloader):
         # Mixed precision forward - use new API
         with torch.amp.autocast('cuda', enabled=scaler is not None, dtype=torch.bfloat16):
-            loss = training_step(model, batch, device)
+            loss = training_step(model, batch, device, use_content_conditioning=use_content_conditioning)
 
             # Check for NaN before scaling
             if torch.isnan(loss) or torch.isinf(loss):

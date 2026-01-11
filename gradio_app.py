@@ -20,6 +20,7 @@ from inference import (
     ae_reconstruct,
     compile_fish_ae,
     compile_model,
+    get_content_latent,
     load_audio,
     load_fish_ae_from_hf,
     load_model_from_hf,
@@ -57,7 +58,8 @@ TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------
 # Model loading (eager for local use)
-base_model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
+# NOTE: delete_blockwise_modules=False keeps the latent_encoder for controllable rhythm/timing
+base_model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=False)
 fish_ae = load_fish_ae_from_hf(dtype=FISH_AE_DTYPE)
 pca_state = load_pca_state_from_hf()
 
@@ -253,6 +255,8 @@ def generate_audio(
     lora_checkpoint_path: str,
     lora_strength: float,
     session_id: str,
+    # Controllable rhythm/timing
+    content_audio_path: str = None,
 ) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     """Generate audio using the model."""
     global model_compiled, fish_ae_compiled, model
@@ -310,6 +314,12 @@ def generate_audio(
     use_zero_speaker = not speaker_audio_path or speaker_audio_path == ""
     speaker_audio = (
         load_audio(speaker_audio_path).cuda() if not use_zero_speaker else None
+    )
+
+    # Load content/rhythm reference audio if provided (for controllable timing)
+    use_content_ref = content_audio_path and content_audio_path != ""
+    content_audio = (
+        load_audio(content_audio_path).cuda() if use_content_ref else None
     )
 
     if use_custom_shapes:
@@ -371,6 +381,8 @@ def generate_audio(
         pad_to_max_text_length=pad_to_max_text_length,
         pad_to_max_speaker_latent_length=pad_to_max_speaker_latent_length,
         normalize_text=True,
+        # Controllable rhythm/timing
+        content_audio=content_audio,
     )
 
     audio_to_save = audio_out[0].cpu()
@@ -756,6 +768,30 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                 label="Speaker Reference Audio (first five minutes used; blank for no speaker reference)",
                 max_length=600,
             )
+
+    gr.HTML('<hr class="section-separator">')
+
+    # Controllable Rhythm/Timing Section
+    gr.Markdown("# Content Reference (Rhythm/Timing)")
+    with gr.Accordion("🎵 Controllable Rhythm/Timing", open=True):
+        gr.Markdown(
+            """
+            Upload a **content reference** audio to control the rhythm and timing of the generated speech.
+
+            - **Speaker Reference** (above): Controls the voice identity (who it sounds like)
+            - **Content Reference** (here): Controls the rhythm, pacing, and timing (how it's delivered)
+
+            <div class="tip-box">
+            💡 **Tip:** Use this to make the model follow the flow/cadence of a rap verse, speech pattern, or any audio you want to mimic the timing of. Leave blank for default timing.
+            </div>
+            """
+        )
+        content_audio_input = gr.Audio(
+            sources=["upload", "microphone"],
+            type="filepath",
+            label="Content/Rhythm Reference Audio (controls timing, pacing; blank for default)",
+            max_length=60,  # 60 seconds max for rhythm reference
+        )
 
     gr.HTML('<hr class="section-separator">')
 
@@ -1210,6 +1246,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             lora_checkpoint,
             lora_strength,
             session_id_state,
+            content_audio_input,  # Controllable rhythm/timing
         ],
         outputs=[
             generated_section,
