@@ -210,6 +210,7 @@ def load_lora_model(
 
         # Load LoRA weights
         load_lora_checkpoint(model, lora_path, device="cuda")
+        model = model.to("cuda")
         model.eval()
 
         # Clear compiled model cache
