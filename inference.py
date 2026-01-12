@@ -26,36 +26,25 @@ def load_model_from_hf(repo_id: str = "jordand/echo-tts-base", device: str = "cu
 
     if delete_blockwise_modules:
         state = {k: v for k, v in state.items() if not (
-            k.startswith("latent_encoder.") or
-            k.startswith("latent_norm") or
-            ".wk_latent" in k or
+            k.startswith("latent_encoder.") or 
+            k.startswith("latent_norm") or 
+            ".wk_latent" in k or 
             ".wv_latent" in k
         )}
-    else:
-        # Initialize latent_encoder from speaker_encoder if not in checkpoint
-        # (They have identical architecture, so weights are compatible)
-        has_latent_encoder = any(k.startswith("latent_encoder.") for k in state.keys())
-        if not has_latent_encoder:
-            for k, v in list(state.items()):
-                if k.startswith("speaker_encoder."):
-                    latent_key = k.replace("speaker_encoder.", "latent_encoder.")
-                    state[latent_key] = v.clone()
-                elif k == "speaker_norm.weight":
-                    state["latent_norm.weight"] = v.clone()
-            # Also copy wk_latent/wv_latent from wk_speaker/wv_speaker
-            for k, v in list(state.items()):
-                if ".wk_speaker" in k:
-                    state[k.replace(".wk_speaker", ".wk_latent")] = v.clone()
-                elif ".wv_speaker" in k:
-                    state[k.replace(".wv_speaker", ".wv_latent")] = v.clone()
 
     if dtype is not None:
         state = {k: v.to(dtype=dtype) for k, v in state.items()}
-
+    
     state = {k: v.to(device=device) for k, v in state.items()}
-
+    
     model.load_state_dict(state, strict=False, assign=True)
     model = model.eval()
+
+    # Ensure latent_encoder (controllable rhythm feature) is on correct dtype
+    # It may not be in base model weights, so needs explicit conversion
+    if dtype is not None and hasattr(model, 'latent_encoder'):
+        model.latent_encoder = model.latent_encoder.to(dtype=dtype, device=device)
+        model.latent_norm = model.latent_norm.to(dtype=dtype, device=device)
 
     if compile:
         model = compile_model(model)
