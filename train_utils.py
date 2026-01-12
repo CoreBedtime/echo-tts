@@ -80,41 +80,7 @@ def load_audio_tensor(
     return audio
 
 
-def segment_audio(
-    audio: torch.Tensor,
-    segment_duration: float = 20.0,
-    sample_rate: int = 44100,
-    min_duration: float = 3.0,
-    overlap: float = 0.0,
-) -> List[torch.Tensor]:
-    """
-    Segment long audio into shorter chunks for training.
-
-    Args:
-        audio: Audio tensor of shape (1, samples)
-        segment_duration: Target segment duration in seconds
-        sample_rate: Audio sample rate
-        min_duration: Minimum segment duration to keep
-        overlap: Overlap between segments (0.0 to 1.0)
-
-    Returns:
-        List of audio tensors
-    """
-    segment_samples = int(segment_duration * sample_rate)
-    min_samples = int(min_duration * sample_rate)
-    hop_samples = int(segment_samples * (1 - overlap))
-
-    segments = []
-    total_samples = audio.shape[1]
-
-    for start in range(0, total_samples, hop_samples):
-        end = min(start + segment_samples, total_samples)
-        segment = audio[:, start:end]
-
-        if segment.shape[1] >= min_samples:
-            segments.append(segment)
-
-    return segments
+# NOTE: Segmentation removed - now using entire audio files for training
 
 
 class EchoTTSDataset(Dataset):
@@ -130,7 +96,7 @@ class EchoTTSDataset(Dataset):
         fish_ae: DAC,
         pca_state: PCAState,
         device: str = "cuda",
-        max_latent_length: int = 640,
+        max_latent_length: Optional[int] = None,
         cache_latents: bool = True,
     ):
         """
@@ -139,7 +105,7 @@ class EchoTTSDataset(Dataset):
             fish_ae: Fish-S1-DAC autoencoder for encoding audio
             pca_state: PCA state for latent transformation
             device: Device for encoding
-            max_latent_length: Maximum latent sequence length (640 = ~30 seconds)
+            max_latent_length: Maximum latent sequence length (None = no limit for training)
             cache_latents: Whether to pre-encode and cache all latents
         """
         self.samples = samples
@@ -156,91 +122,53 @@ class EchoTTSDataset(Dataset):
         if cache_latents:
             self._precompute_latents()
 
-    def _load_audio_segment(
-        self, audio_path: str, sample_rate: int = 44100
-    ) -> torch.Tensor:
+    def _load_audio(self, audio_path: str, sample_rate: int = 44100) -> torch.Tensor:
         """
-        Load audio segment, handling both regular paths and segmented paths.
-
-        Segmented paths have format: /path/to/file.mp3#segment_0
+        Load entire audio file.
         """
-        # Check if this is a segmented path
-        if "#segment_" in audio_path:
-            base_path, segment_info = audio_path.split("#segment_")
-            segment_idx = int(segment_info)
-
-            # Load full audio
-            audio, sr = torchaudio.load(base_path)
-
-            # Convert to mono
-            if audio.shape[0] > 1:
-                audio = audio.mean(dim=0, keepdim=True)
-
-            # Resample if needed
-            if sr != sample_rate:
-                audio = torchaudio.functional.resample(audio, sr, sample_rate)
-                sr = sample_rate
-
-            # Calculate segment boundaries (25s chunks with 10% overlap)
-            chunk_duration = 25.0
-            overlap = 0.1
-            chunk_samples = int(chunk_duration * sr)
-            hop_samples = int(chunk_samples * (1 - overlap))
-
-            # Extract the specific segment
-            start = segment_idx * hop_samples
-            end = min(start + chunk_samples, audio.shape[1])
-            audio = audio[:, start:end]
-
-        else:
-            # Regular path - load entire file
-            audio = load_audio_tensor(audio_path, sample_rate=sample_rate)
-
-        # Normalize
-        audio = audio / torch.clamp(audio.abs().max(), min=1.0)
-
+        # Load entire file
+        audio = load_audio_tensor(audio_path, sample_rate=sample_rate)
         return audio
 
     def _precompute_latents(self):
         """Pre-encode all audio to latents."""
-        print("Pre-encoding audio segments to latents...")
-        print(f"Processing {len(self.samples)} samples (including segmented audio)...")
+        print("Pre-encoding entire audio files to latents...")
+        print(f"Processing {len(self.samples)} samples...")
 
         for i, sample in enumerate(self.samples):
             # Encode target audio
             if sample.audio_path not in self.latent_cache:
-                # Load audio (handles both regular and segmented paths)
-                audio = self._load_audio_segment(sample.audio_path)
+                # Load entire audio file
+                audio = self._load_audio(sample.audio_path)
 
-                # Calculate max audio duration based on max_latent_length
-                # Each latent frame = ~46.67ms of audio at 44.1kHz
-                max_audio_duration = (
-                    self.max_latent_length * 46.67
-                ) / 1000.0  # Convert to seconds
-                max_samples = int(max_audio_duration * 44100)
+                # Only truncate if max_latent_length is specified
+                if self.max_latent_length is not None:
+                    # Calculate max audio duration based on max_latent_length
+                    # Each latent frame = ~46.67ms of audio at 44.1kHz
+                    max_audio_duration = (
+                        self.max_latent_length * 46.67
+                    ) / 1000.0  # Convert to seconds
+                    max_samples = int(max_audio_duration * 44100)
 
-                # Truncate if still too long (shouldn't happen with 25s chunks)
-                if audio.shape[1] > max_samples:
-                    audio = audio[:, :max_samples]
+                    # Truncate if too long for model limits
+                    if audio.shape[1] > max_samples:
+                        audio = audio[:, :max_samples]
 
                 audio = audio.unsqueeze(0).to(self.fish_ae.dtype).to(self.device)
 
                 with torch.no_grad():
                     latent = ae_encode(self.fish_ae, self.pca_state, audio)
-                    # Truncate to max length (safety check)
-                    latent = latent[:, : self.max_latent_length, :]
+                    # Only truncate if max_latent_length is specified
+                    if self.max_latent_length is not None:
+                        latent = latent[:, : self.max_latent_length, :]
 
                 self.latent_cache[sample.audio_path] = latent.cpu()
 
             # Encode speaker audio (use first 30 seconds of base file for speaker reference)
             speaker_path = sample.speaker_audio_path or sample.audio_path
 
-            # Remove segment identifier for speaker reference
-            base_speaker_path = (
-                speaker_path.split("#segment_")[0]
-                if "#segment_" in speaker_path
-                else speaker_path
-            )
+            # Use speaker path directly (no segmentation)
+            base_speaker_path = speaker_path
 
             if base_speaker_path not in self.speaker_cache:
                 audio = load_audio_tensor(base_speaker_path, max_duration=30.0)
@@ -275,20 +203,18 @@ class EchoTTSDataset(Dataset):
         if self.cache_latents:
             latent = self.latent_cache[sample.audio_path]
         else:
-            audio = self._load_audio_segment(sample.audio_path)
+            audio = self._load_audio(sample.audio_path)
             audio = audio.unsqueeze(0).to(self.fish_ae.dtype).to(self.device)
             with torch.no_grad():
                 latent = ae_encode(self.fish_ae, self.pca_state, audio)
-                latent = latent[:, : self.max_latent_length, :]
+                # Only truncate if max_latent_length is specified
+                if self.max_latent_length is not None:
+                    latent = latent[:, : self.max_latent_length, :]
             latent = latent.cpu()
 
-        # Get speaker latent (use base path without segment identifier)
+        # Get speaker latent
         speaker_path = sample.speaker_audio_path or sample.audio_path
-        base_speaker_path = (
-            speaker_path.split("#segment_")[0]
-            if "#segment_" in speaker_path
-            else speaker_path
-        )
+        base_speaker_path = speaker_path
 
         if self.cache_latents:
             speaker_latent, speaker_mask = self.speaker_cache[base_speaker_path]
@@ -473,12 +399,17 @@ def training_step(
     speaker_mask = batch["speaker_mask"].to(device)
 
     # Encode text
-    text_input_ids, text_mask = get_text_input_ids_and_mask(
+    text_result = get_text_input_ids_and_mask(
         batch["text"],
         max_length=None,
         device=device,
         normalize=False,
     )
+    # Handle both 2-tuple and 3-tuple returns
+    if len(text_result) == 2:
+        text_input_ids, text_mask = text_result
+    else:
+        text_input_ids, text_mask, _ = text_result
 
     # Compute loss
     loss = compute_diffusion_loss(
@@ -696,14 +627,11 @@ def transcribe_audio_files_parakeet(
     model_name: str = "nvidia/parakeet-tdt-1.1b",
     language: str = "en",
     batch_size: int = 8,
-    chunk_duration: float = 25.0,
-    overlap: float = 0.1,
 ) -> Dict[str, str]:
     """
     Transcribe multiple audio files using NVIDIA Parakeet (MUCH faster than Whisper).
 
-    Now supports FULL SONG transcription by chunking long audio files!
-    Returns SEGMENTED transcriptions where each audio chunk has its own transcription.
+    Transcribes ENTIRE audio files without segmentation.
 
     Parakeet is optimized for GPU inference and can be 5-10x faster than Whisper.
 
@@ -712,12 +640,9 @@ def transcribe_audio_files_parakeet(
         model_name: Parakeet model name (default: nvidia/parakeet-tdt-1.1b)
         language: Language code (ignored, Parakeet auto-detects)
         batch_size: Files per progress update (default: 8)
-        chunk_duration: Duration of each chunk in seconds (default: 25.0)
-        overlap: Overlap between chunks as fraction (0.0-1.0, default: 0.1 = 10%)
 
     Returns:
-        Dict mapping audio path (with #segment_N suffix for chunks) to transcription
-        This allows each audio segment to have its exact matching transcription!
+        Dict mapping audio path to transcription
     """
     try:
         import torch
@@ -727,9 +652,7 @@ def transcribe_audio_files_parakeet(
 
     print(f"Transcribing {len(audio_paths)} files with Parakeet...")
     print(f"Loading model '{model_name}' (faster than Whisper!)...")
-    print(
-        f"Chunking long audio into {chunk_duration}s segments with {overlap * 100:.0f}% overlap\n"
-    )
+    print(f"Transcribing entire audio files (no segmentation)\n")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -763,55 +686,31 @@ def transcribe_audio_files_parakeet(
                 audio = torchaudio.functional.resample(audio, sr, 16000)
                 sr = 16000
 
-            # Calculate chunk parameters
-            chunk_samples = int(chunk_duration * sr)
-            hop_samples = int(chunk_samples * (1 - overlap))
-            total_samples = audio.shape[1]
-
-            # Segment audio into chunks
-            chunks = []
-            for start in range(0, total_samples, hop_samples):
-                end = min(start + chunk_samples, total_samples)
-                chunk = audio[:, start:end]
-
-                # Only process chunks that are at least 1 second
-                if chunk.shape[1] >= sr:
-                    chunks.append(chunk)
-
-                # Stop if we've covered the whole file
-                if end >= total_samples:
-                    break
-
-            # Transcribe each chunk and store separately
-            for chunk_idx, chunk in enumerate(chunks):
-                # Process with Parakeet
-                inputs = processor(
-                    chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt"
-                )
-                inputs = {k: v.to(device).to(torch_dtype) for k, v in inputs.items()}
-
-                # Generate transcription
-                with torch.no_grad():
-                    generated_ids = model.generate(**inputs)
-
-                text = processor.batch_decode(generated_ids, skip_special_tokens=True)[
-                    0
-                ].strip()
-
-                if text:  # Only add non-empty transcriptions
-                    # Add speaker prefix if not present
-                    if not text.startswith("[") and "S1" not in text:
-                        text = "[S1] " + text
-
-                    # Store with segment identifier
-                    segment_key = f"{path}#segment_{chunk_idx}"
-                    transcriptions[segment_key] = text
-
-            # Show chunk count for this file
-            duration_sec = total_samples / sr
-            print(
-                f"  {os.path.basename(path)}: {duration_sec:.1f}s -> {len(chunks)} segments"
+            # Transcribe entire file
+            inputs = processor(
+                audio.squeeze().numpy(), sampling_rate=16000, return_tensors="pt"
             )
+            inputs = {k: v.to(device).to(torch_dtype) for k, v in inputs.items()}
+
+            # Generate transcription
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs)
+
+            text = processor.batch_decode(generated_ids, skip_special_tokens=True)[
+                0
+            ].strip()
+
+            if text:  # Only add non-empty transcriptions
+                # Add speaker prefix if not present
+                if not text.startswith("[") and "S1" not in text:
+                    text = "[S1] " + text
+
+                # Store transcription
+                transcriptions[path] = text
+
+            # Show duration for this file
+            duration_sec = audio.shape[1] / sr
+            print(f"  {os.path.basename(path)}: {duration_sec:.1f}s")
 
         except Exception as e:
             errors.append((path, str(e)))
@@ -823,7 +722,7 @@ def transcribe_audio_files_parakeet(
 
     print(f"\n{'=' * 60}")
     print(f"Transcription complete!")
-    print(f"  Successful: {len(transcriptions)}")
+    print(f"  Successfully transcribed: {len(transcriptions)} files")
     print(f"  Errors: {len(errors)}")
     print(f"{'=' * 60}")
 
@@ -913,8 +812,6 @@ def prepare_samples_from_directory(
     audio_dir: str,
     transcriptions: Optional[Dict[str, str]] = None,
     extensions: Tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".m4a"),
-    segment_duration: float = 20.0,
-    min_duration: float = 3.0,
 ) -> List[TrainingSample]:
     """
     Prepare training samples from a directory of audio files.
@@ -923,18 +820,16 @@ def prepare_samples_from_directory(
         audio_dir: Directory containing audio files
         transcriptions: Optional dict of audio_path -> text. If None, will need transcription.
         extensions: Audio file extensions to include
-        segment_duration: Target segment duration for splitting long files
-        min_duration: Minimum duration to keep
 
     Returns:
         List of TrainingSample objects
     """
-    audio_dir = Path(audio_dir)
+    audio_dir_path = Path(audio_dir)
     audio_files = []
 
     for ext in extensions:
-        audio_files.extend(audio_dir.glob(f"*{ext}"))
-        audio_files.extend(audio_dir.glob(f"*{ext.upper()}"))
+        audio_files.extend(audio_dir_path.glob(f"*{ext}"))
+        audio_files.extend(audio_dir_path.glob(f"*{ext.upper()}"))
 
     samples = []
 

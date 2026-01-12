@@ -370,7 +370,7 @@ def generate_audio(
         rng_seed=rng_seed_int,
         pad_to_max_text_length=pad_to_max_text_length,
         pad_to_max_speaker_latent_length=pad_to_max_speaker_latent_length,
-        normalize_text=True,
+        normalize_text=False,
     )
 
     audio_to_save = audio_out[0].cpu()
