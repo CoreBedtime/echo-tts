@@ -194,9 +194,9 @@ def load_lora_model(
         config = checkpoint.get("config", {})
 
         # Reload base model fresh
-        model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
+        # NOTE: delete_blockwise_modules=False keeps latent_encoder for controllable rhythm
+        model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=False)
 
-        model = model.to_empty(device="cuda")
         # Apply LoRA structure with strength-scaled alpha
         base_alpha = config.get("alpha", 32.0)
         scaled_alpha = base_alpha * lora_strength
@@ -211,7 +211,6 @@ def load_lora_model(
 
         # Load LoRA weights
         load_lora_checkpoint(model, lora_path, device="cuda")
-        model = model.to("cuda")
         model.eval()
 
         # Clear compiled model cache
