@@ -23,11 +23,17 @@ from inference import (
     load_pca_state_from_hf,
     load_audio,
     ae_reconstruct,
+    ae_encode,
+    ae_decode,
     sample_pipeline,
     compile_model,
     compile_fish_ae,
-    sample_euler_cfg_independent_guidances
+    sample_euler_cfg_independent_guidances,
+    get_speaker_latent_and_mask,
+    get_text_input_ids_and_mask,
+    crop_audio_to_flattening_point,
 )
+from inference_blockwise import sample_blockwise_euler_cfg_independent_guidances
 
 # --------------------------------------------------------------------
 # IF ON 8GB VRAM GPU, SET FISH_AE_DTYPE to bfloat16 and DEFAULT_SAMPLE_LATENT_LENGTH to < 640 (e.g., 576)
@@ -57,7 +63,8 @@ TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------
 # Model loading (eager for local use)
-model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
+# Note: delete_blockwise_modules=False to enable continuation and rhythm transfer modes
+model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=False)
 fish_ae = load_fish_ae_from_hf(dtype=FISH_AE_DTYPE)
 pca_state = load_pca_state_from_hf()
 
@@ -316,6 +323,343 @@ def generate_audio(
         gr.update(visible=(show_original_audio and speaker_audio is not None)),
         gr.update(visible=(reconstruct_first_30_seconds and speaker_audio is not None)),
         gr.update(visible=show_reference_section),
+    )
+
+
+def generate_audio_continuation(
+    text_prompt: str,
+    speaker_audio_path: str,
+    continuation_audio_path: str,
+    continuation_new_latents: int,
+    num_steps: int,
+    rng_seed: int,
+    cfg_scale_text: float,
+    cfg_scale_speaker: float,
+    cfg_min_t: float,
+    cfg_max_t: float,
+    truncation_factor: float,
+    rescale_k: float,
+    rescale_sigma: float,
+    force_speaker: bool,
+    speaker_kv_scale: float,
+    speaker_kv_min_t: float,
+    speaker_kv_max_layers: int,
+    audio_format: str,
+    session_id: str,
+) -> Tuple[Any, Any, Any, Any]:
+    """Generate audio continuing from an existing audio clip using blockwise generation."""
+
+    cleanup_temp_audio(TEMP_AUDIO_DIR, session_id)
+    start_time = time.time()
+
+    device, dtype = model.device, model.dtype
+
+    # Validate inputs
+    if not continuation_audio_path:
+        return (
+            gr.update(),
+            gr.update(value=None, visible=True),
+            gr.update(value="**Error:** Please provide continuation audio to continue from.", visible=True),
+            gr.update(value="", visible=False),
+        )
+
+    # Parse parameters
+    num_steps_int = min(max(int(num_steps), 1), 80)
+    rng_seed_int = int(rng_seed) if rng_seed is not None else 0
+    cfg_scale_text_val = float(cfg_scale_text)
+    cfg_scale_speaker_val = float(cfg_scale_speaker) if cfg_scale_speaker is not None else 5.0
+    cfg_min_t_val = float(cfg_min_t)
+    cfg_max_t_val = float(cfg_max_t)
+    truncation_factor_val = float(truncation_factor)
+    rescale_k_val = float(rescale_k) if rescale_k != 1.0 else None
+    rescale_sigma_val = float(rescale_sigma)
+    continuation_new_latents_val = int(continuation_new_latents) if continuation_new_latents else 256
+
+    speaker_kv_enabled = bool(force_speaker)
+    if speaker_kv_enabled:
+        speaker_kv_scale_val = float(speaker_kv_scale) if speaker_kv_scale is not None else None
+        speaker_kv_min_t_val = float(speaker_kv_min_t) if speaker_kv_min_t is not None else None
+        speaker_kv_max_layers_val = int(speaker_kv_max_layers) if speaker_kv_max_layers is not None else None
+    else:
+        speaker_kv_scale_val = None
+        speaker_kv_min_t_val = None
+        speaker_kv_max_layers_val = None
+
+    # Load speaker audio
+    use_zero_speaker = not speaker_audio_path or speaker_audio_path == ""
+    if use_zero_speaker:
+        speaker_latent = torch.zeros((1, 4, 80), device=device, dtype=dtype)
+        speaker_mask = torch.zeros((1, 4), device=device, dtype=torch.bool)
+    else:
+        speaker_audio = load_audio(speaker_audio_path).to(device)
+        speaker_latent, speaker_mask = get_speaker_latent_and_mask(fish_ae, pca_state, speaker_audio)
+
+    # Load and encode continuation audio
+    continuation_audio = load_audio(continuation_audio_path).to(device)
+    continuation_latent, continuation_mask = get_speaker_latent_and_mask(fish_ae, pca_state, continuation_audio)
+    # Trim to actual content (remove padding)
+    actual_len = continuation_mask.sum().item()
+    continuation_latent = continuation_latent[:, :actual_len]
+
+    # Check that total length won't exceed 640
+    max_new_latents = 640 - continuation_latent.shape[1]
+    if max_new_latents <= 0:
+        return (
+            gr.update(),
+            gr.update(value=None, visible=True),
+            gr.update(value=f"**Error:** Continuation audio is too long ({continuation_latent.shape[1]} latents). Maximum is 640 latents (~30s).", visible=True),
+            gr.update(value="", visible=False),
+        )
+
+    # Clamp new latents to available space
+    continuation_new_latents_val = min(continuation_new_latents_val, max_new_latents)
+
+    # Prepare text
+    text_input_ids, text_mask, normalized_text = get_text_input_ids_and_mask(
+        [text_prompt], max_length=None, device=device, normalize=True, return_normalized_text=True
+    )
+
+    # Generate using blockwise sampling
+    latent_out = sample_blockwise_euler_cfg_independent_guidances(
+        model=model,
+        speaker_latent=speaker_latent,
+        speaker_mask=speaker_mask,
+        text_input_ids=text_input_ids,
+        text_mask=text_mask,
+        rng_seed=rng_seed_int,
+        block_sizes=[continuation_new_latents_val],
+        num_steps=num_steps_int,
+        cfg_scale_text=cfg_scale_text_val,
+        cfg_scale_speaker=cfg_scale_speaker_val,
+        cfg_min_t=cfg_min_t_val,
+        cfg_max_t=cfg_max_t_val,
+        truncation_factor=truncation_factor_val,
+        rescale_k=rescale_k_val,
+        rescale_sigma=rescale_sigma_val,
+        speaker_kv_scale=speaker_kv_scale_val,
+        speaker_kv_max_layers=speaker_kv_max_layers_val,
+        speaker_kv_min_t=speaker_kv_min_t_val,
+        continuation_latent=continuation_latent,
+    )
+
+    # Decode to audio
+    audio_out = ae_decode(fish_ae, pca_state, latent_out)
+    audio_out = crop_audio_to_flattening_point(audio_out, latent_out[0])
+
+    audio_to_save = audio_out[0].cpu()
+    stem = make_stem("continuation", session_id)
+    output_path = save_audio_with_format(audio_to_save, TEMP_AUDIO_DIR, stem, 44100, audio_format)
+
+    generation_time = time.time() - start_time
+    time_str = f"⏱️ Total generation time: {generation_time:.2f}s"
+    text_display = f"**Text Prompt (normalized):**\n\n{normalized_text[0]}\n\n**Continuation Info:**\n- Continuation latents: {continuation_latent.shape[1]} (~{continuation_latent.shape[1] * 2048 / 44100:.1f}s)\n- New latents generated: {continuation_new_latents_val} (~{continuation_new_latents_val * 2048 / 44100:.1f}s)"
+
+    return (
+        gr.update(),
+        gr.update(value=str(output_path), visible=True),
+        gr.update(value=text_display, visible=True),
+        gr.update(value=time_str, visible=True),
+    )
+
+
+def extract_rhythm_block_sizes(
+    rhythm_audio: torch.Tensor,
+    target_total_latents: int,
+    min_block_size: int = 16,
+    num_blocks: int = 8,
+) -> list:
+    """
+    Extract rhythm/timing information from audio and convert to block sizes.
+
+    This analyzes the energy envelope of the audio to determine speaking rhythm
+    and maps it to block sizes for generation.
+    """
+    # Encode the rhythm source audio to latents
+    rhythm_latent = ae_encode(fish_ae, pca_state, rhythm_audio.unsqueeze(0))
+    rhythm_len = rhythm_latent.shape[1]
+
+    # Compute energy per latent frame (simple L2 norm)
+    energy = torch.norm(rhythm_latent[0], dim=-1)
+
+    # Normalize and segment into blocks
+    # We'll create blocks proportional to the rhythm audio duration
+    scale_factor = target_total_latents / rhythm_len
+
+    # Split rhythm into num_blocks segments and compute relative durations
+    segment_size = rhythm_len // num_blocks
+    block_sizes = []
+
+    for i in range(num_blocks):
+        start = i * segment_size
+        end = start + segment_size if i < num_blocks - 1 else rhythm_len
+
+        # Use segment length scaled to target
+        seg_len = end - start
+        block_size = int(seg_len * scale_factor)
+        block_size = max(min_block_size, block_size)
+        # Round to multiple of 4 for model compatibility
+        block_size = (block_size // 4) * 4
+        if block_size < 4:
+            block_size = 4
+        block_sizes.append(block_size)
+
+    # Adjust to match target total
+    current_total = sum(block_sizes)
+    if current_total != target_total_latents:
+        diff = target_total_latents - current_total
+        # Distribute difference across blocks
+        per_block = diff // len(block_sizes)
+        remainder = diff % len(block_sizes)
+        for i in range(len(block_sizes)):
+            adjustment = per_block + (1 if i < abs(remainder) else 0)
+            if diff < 0:
+                adjustment = -abs(adjustment)
+            block_sizes[i] = max(4, block_sizes[i] + adjustment)
+            # Keep divisible by 4
+            block_sizes[i] = (block_sizes[i] // 4) * 4
+
+    # Final adjustment to hit exact target
+    current_total = sum(block_sizes)
+    if current_total != target_total_latents:
+        diff = target_total_latents - current_total
+        block_sizes[-1] = max(4, block_sizes[-1] + diff)
+
+    return block_sizes
+
+
+def generate_audio_rhythm_transfer(
+    text_prompt: str,
+    speaker_audio_path: str,
+    rhythm_source_path: str,
+    target_duration_seconds: float,
+    num_rhythm_blocks: int,
+    num_steps: int,
+    rng_seed: int,
+    cfg_scale_text: float,
+    cfg_scale_speaker: float,
+    cfg_min_t: float,
+    cfg_max_t: float,
+    truncation_factor: float,
+    rescale_k: float,
+    rescale_sigma: float,
+    force_speaker: bool,
+    speaker_kv_scale: float,
+    speaker_kv_min_t: float,
+    speaker_kv_max_layers: int,
+    audio_format: str,
+    session_id: str,
+) -> Tuple[Any, Any, Any, Any]:
+    """Generate audio using rhythm/timing extracted from a reference audio clip."""
+
+    cleanup_temp_audio(TEMP_AUDIO_DIR, session_id)
+    start_time = time.time()
+
+    device, dtype = model.device, model.dtype
+
+    # Validate inputs
+    if not rhythm_source_path:
+        return (
+            gr.update(),
+            gr.update(value=None, visible=True),
+            gr.update(value="**Error:** Please provide a rhythm source audio.", visible=True),
+            gr.update(value="", visible=False),
+        )
+
+    # Parse parameters
+    num_steps_int = min(max(int(num_steps), 1), 80)
+    rng_seed_int = int(rng_seed) if rng_seed is not None else 0
+    cfg_scale_text_val = float(cfg_scale_text)
+    cfg_scale_speaker_val = float(cfg_scale_speaker) if cfg_scale_speaker is not None else 5.0
+    cfg_min_t_val = float(cfg_min_t)
+    cfg_max_t_val = float(cfg_max_t)
+    truncation_factor_val = float(truncation_factor)
+    rescale_k_val = float(rescale_k) if rescale_k != 1.0 else None
+    rescale_sigma_val = float(rescale_sigma)
+    target_duration = float(target_duration_seconds) if target_duration_seconds else 10.0
+    num_blocks = int(num_rhythm_blocks) if num_rhythm_blocks else 8
+
+    speaker_kv_enabled = bool(force_speaker)
+    if speaker_kv_enabled:
+        speaker_kv_scale_val = float(speaker_kv_scale) if speaker_kv_scale is not None else None
+        speaker_kv_min_t_val = float(speaker_kv_min_t) if speaker_kv_min_t is not None else None
+        speaker_kv_max_layers_val = int(speaker_kv_max_layers) if speaker_kv_max_layers is not None else None
+    else:
+        speaker_kv_scale_val = None
+        speaker_kv_min_t_val = None
+        speaker_kv_max_layers_val = None
+
+    # Load speaker audio
+    use_zero_speaker = not speaker_audio_path or speaker_audio_path == ""
+    if use_zero_speaker:
+        speaker_latent = torch.zeros((1, 4, 80), device=device, dtype=dtype)
+        speaker_mask = torch.zeros((1, 4), device=device, dtype=torch.bool)
+    else:
+        speaker_audio = load_audio(speaker_audio_path).to(device)
+        speaker_latent, speaker_mask = get_speaker_latent_and_mask(fish_ae, pca_state, speaker_audio)
+
+    # Load rhythm source audio
+    rhythm_audio = load_audio(rhythm_source_path).to(device)
+
+    # Calculate target latents from duration (sample rate 44100, downsample factor 2048)
+    target_latents = min(int(target_duration * 44100 / 2048), 640)
+    target_latents = (target_latents // 4) * 4  # Ensure divisible by 4
+
+    # Extract rhythm-based block sizes
+    block_sizes = extract_rhythm_block_sizes(
+        rhythm_audio,
+        target_total_latents=target_latents,
+        min_block_size=16,
+        num_blocks=num_blocks,
+    )
+
+    # Prepare text
+    text_input_ids, text_mask, normalized_text = get_text_input_ids_and_mask(
+        [text_prompt], max_length=None, device=device, normalize=True, return_normalized_text=True
+    )
+
+    # Generate using blockwise sampling with rhythm-derived blocks
+    latent_out = sample_blockwise_euler_cfg_independent_guidances(
+        model=model,
+        speaker_latent=speaker_latent,
+        speaker_mask=speaker_mask,
+        text_input_ids=text_input_ids,
+        text_mask=text_mask,
+        rng_seed=rng_seed_int,
+        block_sizes=block_sizes,
+        num_steps=num_steps_int,
+        cfg_scale_text=cfg_scale_text_val,
+        cfg_scale_speaker=cfg_scale_speaker_val,
+        cfg_min_t=cfg_min_t_val,
+        cfg_max_t=cfg_max_t_val,
+        truncation_factor=truncation_factor_val,
+        rescale_k=rescale_k_val,
+        rescale_sigma=rescale_sigma_val,
+        speaker_kv_scale=speaker_kv_scale_val,
+        speaker_kv_max_layers=speaker_kv_max_layers_val,
+        speaker_kv_min_t=speaker_kv_min_t_val,
+        continuation_latent=None,
+    )
+
+    # Decode to audio
+    audio_out = ae_decode(fish_ae, pca_state, latent_out)
+    audio_out = crop_audio_to_flattening_point(audio_out, latent_out[0])
+
+    audio_to_save = audio_out[0].cpu()
+    stem = make_stem("rhythm_transfer", session_id)
+    output_path = save_audio_with_format(audio_to_save, TEMP_AUDIO_DIR, stem, 44100, audio_format)
+
+    generation_time = time.time() - start_time
+    time_str = f"⏱️ Total generation time: {generation_time:.2f}s"
+
+    # Format block sizes for display
+    block_info = ", ".join([str(b) for b in block_sizes])
+    text_display = f"**Text Prompt (normalized):**\n\n{normalized_text[0]}\n\n**Rhythm Transfer Info:**\n- Target duration: {target_duration:.1f}s ({target_latents} latents)\n- Number of blocks: {len(block_sizes)}\n- Block sizes: [{block_info}]"
+
+    return (
+        gr.update(),
+        gr.update(value=str(output_path), visible=True),
+        gr.update(value=text_display, visible=True),
+        gr.update(value=time_str, visible=True),
     )
 
 
@@ -593,9 +937,18 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
     with gr.Accordion("📖 Quick Start Instructions", open=True):
         gr.Markdown(
             """
+            **Standard Mode:**
             1. Upload or record a short reference clip (or leave blank for no speaker reference).
             2. Pick a text preset or type your own prompt.
             3. Click **Generate Audio**.
+
+            **Continuation Mode:** Generate audio that continues from an existing clip.
+            - Upload the audio to continue from in the Continuation Settings
+            - Text prompt must include ALL text (original + new)
+
+            **Rhythm Transfer Mode:** Apply the speaking rhythm from one audio to new speech.
+            - Upload a rhythm source audio
+            - The generated speech will follow similar pacing
 
             <div class="tip-box">
             💡 **Tip:** If the generated voice does not match the reference, enable "Force Speaker" and regenerate.
@@ -649,6 +1002,81 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
 
     gr.HTML('<hr class="section-separator">')
     gr.Markdown("# Generation")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            pass
+        with gr.Column(scale=2):
+            generation_mode = gr.Radio(
+                choices=["Standard", "Continuation", "Rhythm Transfer"],
+                value="Standard",
+                label="Generation Mode",
+                info="Standard: normal generation | Continuation: continue from existing audio | Rhythm Transfer: use timing from reference",
+            )
+        with gr.Column(scale=1):
+            pass
+
+    # Continuation Mode Settings
+    with gr.Accordion("🔗 Continuation Settings", open=True, visible=False) as continuation_settings:
+        gr.Markdown("""
+        **Continuation Mode** generates new audio that seamlessly continues from an existing audio clip.
+
+        - Upload the audio you want to continue from
+        - The text prompt should include ALL text (both the original and the new text to generate)
+        - Use [WhisperD](https://huggingface.co/jordand/whisper-d-v1a) for accurate transcription of the original audio
+        """)
+        with gr.Row():
+            continuation_audio_input = gr.Audio(
+                sources=["upload", "microphone"],
+                type="filepath",
+                label="Audio to Continue From",
+                max_length=30,
+            )
+            with gr.Column():
+                continuation_new_latents = gr.Number(
+                    label="New Latents to Generate",
+                    value=256,
+                    info="How many new latents to generate (~46ms each). Max depends on continuation length. 256 ≈ 12s",
+                    minimum=16,
+                    maximum=640,
+                    step=16,
+                    precision=0,
+                )
+
+    # Rhythm Transfer Mode Settings
+    with gr.Accordion("🎵 Rhythm Transfer Settings", open=True, visible=False) as rhythm_settings:
+        gr.Markdown("""
+        **Rhythm Transfer Mode** extracts the speaking rhythm/pacing from a reference audio and applies it to new speech.
+
+        - Upload a reference audio whose rhythm you want to mimic
+        - The generated audio will have similar pacing and timing patterns
+        - This works by analyzing the reference and creating block sizes that match its temporal structure
+        """)
+        with gr.Row():
+            rhythm_source_input = gr.Audio(
+                sources=["upload", "microphone"],
+                type="filepath",
+                label="Rhythm Source Audio",
+                max_length=60,
+            )
+            with gr.Column():
+                rhythm_target_duration = gr.Number(
+                    label="Target Duration (seconds)",
+                    value=10.0,
+                    info="Desired output duration in seconds (max ~30s)",
+                    minimum=1.0,
+                    maximum=30.0,
+                    step=0.5,
+                )
+                rhythm_num_blocks = gr.Number(
+                    label="Number of Rhythm Blocks",
+                    value=8,
+                    info="How many blocks to divide the generation into (more = finer rhythm control)",
+                    minimum=2,
+                    maximum=32,
+                    step=1,
+                    precision=0,
+                )
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -860,6 +1288,19 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
 
     text_presets_table.select(select_text_preset, outputs=text_prompt)
 
+    def toggle_generation_mode(mode):
+        """Show/hide mode-specific settings based on generation mode."""
+        return (
+            gr.update(visible=(mode == "Continuation")),
+            gr.update(visible=(mode == "Rhythm Transfer")),
+        )
+
+    generation_mode.change(
+        toggle_generation_mode,
+        inputs=[generation_mode],
+        outputs=[continuation_settings, rhythm_settings],
+    )
+
     mode_selector.change(toggle_mode, inputs=[mode_selector], outputs=[advanced_mode_column])
 
     force_speaker.change(update_force_row, inputs=[force_speaker], outputs=[speaker_kv_row])
@@ -927,11 +1368,148 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
         ],
     )
 
+    def generate_router(
+        gen_mode,
+        text_prompt_val,
+        speaker_audio_path,
+        continuation_audio_path,
+        continuation_new_latents_val,
+        rhythm_source_path,
+        rhythm_target_duration_val,
+        rhythm_num_blocks_val,
+        num_steps_val,
+        rng_seed_val,
+        cfg_scale_text_val,
+        cfg_scale_speaker_val,
+        cfg_min_t_val,
+        cfg_max_t_val,
+        truncation_factor_val,
+        rescale_k_val,
+        rescale_sigma_val,
+        force_speaker_val,
+        speaker_kv_scale_val,
+        speaker_kv_min_t_val,
+        speaker_kv_max_layers_val,
+        reconstruct_first_30_seconds_val,
+        use_custom_shapes_val,
+        max_text_byte_length_val,
+        max_speaker_latent_length_val,
+        sample_latent_length_val,
+        audio_format_val,
+        compile_val,
+        show_original_audio_val,
+        session_id_val,
+    ):
+        """Route to the appropriate generation function based on mode."""
+        if gen_mode == "Continuation":
+            result = generate_audio_continuation(
+                text_prompt=text_prompt_val,
+                speaker_audio_path=speaker_audio_path,
+                continuation_audio_path=continuation_audio_path,
+                continuation_new_latents=continuation_new_latents_val,
+                num_steps=num_steps_val,
+                rng_seed=rng_seed_val,
+                cfg_scale_text=cfg_scale_text_val,
+                cfg_scale_speaker=cfg_scale_speaker_val,
+                cfg_min_t=cfg_min_t_val,
+                cfg_max_t=cfg_max_t_val,
+                truncation_factor=truncation_factor_val,
+                rescale_k=rescale_k_val,
+                rescale_sigma=rescale_sigma_val,
+                force_speaker=force_speaker_val,
+                speaker_kv_scale=speaker_kv_scale_val,
+                speaker_kv_min_t=speaker_kv_min_t_val,
+                speaker_kv_max_layers=speaker_kv_max_layers_val,
+                audio_format=audio_format_val,
+                session_id=session_id_val,
+            )
+            # Return with empty values for unused outputs
+            return (
+                result[0],  # generated_section
+                result[1],  # generated_audio
+                result[2],  # text_prompt_display
+                gr.update(),  # original_audio
+                result[3],  # generation_time_display
+                gr.update(),  # reference_audio
+                gr.update(visible=False),  # original_accordion
+                gr.update(visible=False),  # reference_accordion
+                gr.update(visible=False),  # reference_audio_header
+            )
+        elif gen_mode == "Rhythm Transfer":
+            result = generate_audio_rhythm_transfer(
+                text_prompt=text_prompt_val,
+                speaker_audio_path=speaker_audio_path,
+                rhythm_source_path=rhythm_source_path,
+                target_duration_seconds=rhythm_target_duration_val,
+                num_rhythm_blocks=rhythm_num_blocks_val,
+                num_steps=num_steps_val,
+                rng_seed=rng_seed_val,
+                cfg_scale_text=cfg_scale_text_val,
+                cfg_scale_speaker=cfg_scale_speaker_val,
+                cfg_min_t=cfg_min_t_val,
+                cfg_max_t=cfg_max_t_val,
+                truncation_factor=truncation_factor_val,
+                rescale_k=rescale_k_val,
+                rescale_sigma=rescale_sigma_val,
+                force_speaker=force_speaker_val,
+                speaker_kv_scale=speaker_kv_scale_val,
+                speaker_kv_min_t=speaker_kv_min_t_val,
+                speaker_kv_max_layers=speaker_kv_max_layers_val,
+                audio_format=audio_format_val,
+                session_id=session_id_val,
+            )
+            # Return with empty values for unused outputs
+            return (
+                result[0],  # generated_section
+                result[1],  # generated_audio
+                result[2],  # text_prompt_display
+                gr.update(),  # original_audio
+                result[3],  # generation_time_display
+                gr.update(),  # reference_audio
+                gr.update(visible=False),  # original_accordion
+                gr.update(visible=False),  # reference_accordion
+                gr.update(visible=False),  # reference_audio_header
+            )
+        else:
+            # Standard mode
+            return generate_audio(
+                text_prompt=text_prompt_val,
+                speaker_audio_path=speaker_audio_path,
+                num_steps=num_steps_val,
+                rng_seed=rng_seed_val,
+                cfg_scale_text=cfg_scale_text_val,
+                cfg_scale_speaker=cfg_scale_speaker_val,
+                cfg_min_t=cfg_min_t_val,
+                cfg_max_t=cfg_max_t_val,
+                truncation_factor=truncation_factor_val,
+                rescale_k=rescale_k_val,
+                rescale_sigma=rescale_sigma_val,
+                force_speaker=force_speaker_val,
+                speaker_kv_scale=speaker_kv_scale_val,
+                speaker_kv_min_t=speaker_kv_min_t_val,
+                speaker_kv_max_layers=speaker_kv_max_layers_val,
+                reconstruct_first_30_seconds=reconstruct_first_30_seconds_val,
+                use_custom_shapes=use_custom_shapes_val,
+                max_text_byte_length=max_text_byte_length_val,
+                max_speaker_latent_length=max_speaker_latent_length_val,
+                sample_latent_length=sample_latent_length_val,
+                audio_format=audio_format_val,
+                use_compile=compile_val,
+                show_original_audio=show_original_audio_val,
+                session_id=session_id_val,
+            )
+
     generate_btn.click(
-        generate_audio,
+        generate_router,
         inputs=[
+            generation_mode,
             text_prompt,
             custom_audio_input,
+            continuation_audio_input,
+            continuation_new_latents,
+            rhythm_source_input,
+            rhythm_target_duration,
+            rhythm_num_blocks,
             num_steps,
             rng_seed,
             cfg_scale_text,
