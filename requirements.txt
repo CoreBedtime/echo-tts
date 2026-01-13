@@ -6,3 +6,6 @@ numpy
 safetensors
 einops
 gradio==5.49.1
+# For rhythm transfer mode (phoneme extraction)
+transformers
+g2p_en

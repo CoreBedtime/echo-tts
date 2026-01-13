@@ -35,6 +35,11 @@ from inference import (
 )
 from inference_blockwise import sample_blockwise_euler_cfg_independent_guidances
 
+# Phoneme extraction imports (lazy loaded)
+phoneme_processor = None
+phoneme_model = None
+g2p_model = None
+
 # --------------------------------------------------------------------
 # IF ON 8GB VRAM GPU, SET FISH_AE_DTYPE to bfloat16 and DEFAULT_SAMPLE_LATENT_LENGTH to < 640 (e.g., 576)
 
@@ -462,69 +467,346 @@ def generate_audio_continuation(
     )
 
 
-def extract_rhythm_block_sizes(
-    rhythm_audio: torch.Tensor,
+def load_phoneme_models():
+    """Lazy load phoneme recognition and G2P models."""
+    global phoneme_processor, phoneme_model, g2p_model
+
+    if phoneme_processor is None:
+        print("Loading phoneme recognition model (wav2vec2)...")
+        from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+        phoneme_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-lv-60-espeak-cv-ft")
+        phoneme_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-lv-60-espeak-cv-ft")
+        phoneme_model = phoneme_model.to("cuda").eval()
+        print("Phoneme model loaded.")
+
+    if g2p_model is None:
+        print("Loading G2P model...")
+        try:
+            from g2p_en import G2p
+            g2p_model = G2p()
+            print("G2P model loaded.")
+        except ImportError:
+            print("Warning: g2p_en not installed. Using fallback character-based alignment.")
+            g2p_model = "fallback"
+
+    return phoneme_processor, phoneme_model, g2p_model
+
+
+@torch.inference_mode()
+def extract_phonemes_from_audio(audio: torch.Tensor, sample_rate: int = 44100) -> list:
+    """
+    Extract phoneme sequence with timestamps from audio using wav2vec2.
+
+    Returns:
+        List of (phoneme, start_time, end_time) tuples
+    """
+    processor, model, _ = load_phoneme_models()
+
+    # Resample to 16kHz for wav2vec2
+    if sample_rate != 16000:
+        audio_16k = torchaudio.functional.resample(audio, sample_rate, 16000)
+    else:
+        audio_16k = audio
+
+    # Ensure mono
+    if audio_16k.dim() == 2:
+        audio_16k = audio_16k.mean(dim=0)
+    elif audio_16k.dim() == 1:
+        pass
+    else:
+        audio_16k = audio_16k.squeeze()
+
+    # Process through wav2vec2
+    inputs = processor(audio_16k.cpu().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
+    input_values = inputs.input_values.to("cuda")
+
+    logits = model(input_values).logits
+    predicted_ids = torch.argmax(logits, dim=-1)
+
+    # Decode to phonemes
+    transcription = processor.decode(predicted_ids[0])
+
+    # Get frame-level predictions for timing
+    probs = torch.softmax(logits, dim=-1)
+    predicted_ids_seq = predicted_ids[0].cpu().tolist()
+
+    # wav2vec2 outputs at 50Hz (20ms per frame)
+    frame_duration = 0.02  # 20ms
+
+    # Extract phoneme segments with timestamps
+    phoneme_segments = []
+    current_phoneme = None
+    segment_start = 0
+
+    vocab = processor.tokenizer.get_vocab()
+    id_to_token = {v: k for k, v in vocab.items()}
+
+    for i, token_id in enumerate(predicted_ids_seq):
+        token = id_to_token.get(token_id, "")
+
+        # Skip blank/padding tokens
+        if token in ["<pad>", "<s>", "</s>", "<unk>", "|", ""]:
+            if current_phoneme is not None:
+                phoneme_segments.append((current_phoneme, segment_start * frame_duration, i * frame_duration))
+                current_phoneme = None
+            continue
+
+        if token != current_phoneme:
+            if current_phoneme is not None:
+                phoneme_segments.append((current_phoneme, segment_start * frame_duration, i * frame_duration))
+            current_phoneme = token
+            segment_start = i
+
+    # Add final segment
+    if current_phoneme is not None:
+        phoneme_segments.append((current_phoneme, segment_start * frame_duration, len(predicted_ids_seq) * frame_duration))
+
+    return phoneme_segments
+
+
+def text_to_phonemes(text: str) -> list:
+    """Convert text to phoneme sequence using G2P."""
+    _, _, g2p = load_phoneme_models()
+
+    if g2p == "fallback":
+        # Simple fallback: treat each character as a "phoneme"
+        return [c for c in text.lower() if c.isalnum() or c == ' ']
+
+    # Use G2P model
+    phonemes = g2p(text)
+    # Filter out spaces and stress markers, normalize
+    cleaned = []
+    for p in phonemes:
+        p = p.strip()
+        if p and p not in [' ', "'", ',', '.', '?', '!']:
+            # Remove stress markers (numbers)
+            p_clean = ''.join(c for c in p if not c.isdigit())
+            if p_clean:
+                cleaned.append(p_clean.upper())
+    return cleaned
+
+
+def align_phoneme_sequences(ref_phonemes: list, target_phonemes: list) -> list:
+    """
+    Align reference phoneme sequence (with timings) to target phoneme sequence.
+    Uses Dynamic Time Warping to find optimal alignment.
+
+    Returns:
+        List of (target_phoneme, estimated_duration) tuples
+    """
+    ref_phones = [p[0] for p in ref_phonemes]
+    ref_durations = [p[2] - p[1] for p in ref_phonemes]
+
+    n_ref = len(ref_phones)
+    n_target = len(target_phonemes)
+
+    if n_ref == 0 or n_target == 0:
+        # Fallback: equal distribution
+        avg_duration = sum(ref_durations) / len(ref_durations) if ref_durations else 0.1
+        return [(p, avg_duration) for p in target_phonemes]
+
+    # Simple phoneme similarity (1 if same, 0.5 if similar class, 0 otherwise)
+    def phoneme_similarity(p1, p2):
+        p1, p2 = p1.upper(), p2.upper()
+        if p1 == p2:
+            return 1.0
+
+        # Group similar phonemes
+        vowels = set("AEIOUƏꞮƱƐƆÆⱭ")
+        stops = set("PTBDKG")
+        fricatives = set("FVSZHƩƷΘÐ")
+        nasals = set("MNŊ")
+        liquids = set("LRW")
+
+        for group in [vowels, stops, fricatives, nasals, liquids]:
+            if p1 in group and p2 in group:
+                return 0.5
+        return 0.0
+
+    # Build DTW cost matrix
+    cost = torch.zeros((n_ref + 1, n_target + 1))
+    cost[0, :] = float('inf')
+    cost[:, 0] = float('inf')
+    cost[0, 0] = 0
+
+    for i in range(1, n_ref + 1):
+        for j in range(1, n_target + 1):
+            sim = phoneme_similarity(ref_phones[i-1], target_phonemes[j-1])
+            match_cost = 1.0 - sim
+            cost[i, j] = match_cost + min(cost[i-1, j-1], cost[i-1, j], cost[i, j-1])
+
+    # Backtrack to find alignment
+    alignment = []
+    i, j = n_ref, n_target
+
+    while i > 0 and j > 0:
+        alignment.append((i-1, j-1))
+        candidates = [
+            (cost[i-1, j-1], i-1, j-1),
+            (cost[i-1, j], i-1, j),
+            (cost[i, j-1], i, j-1),
+        ]
+        _, i, j = min(candidates, key=lambda x: x[0])
+
+    alignment.reverse()
+
+    # Map durations from reference to target
+    target_durations = [0.0] * n_target
+    target_counts = [0] * n_target
+
+    for ref_idx, tgt_idx in alignment:
+        target_durations[tgt_idx] += ref_durations[ref_idx]
+        target_counts[tgt_idx] += 1
+
+    # Average durations for phonemes mapped multiple times
+    result = []
+    for i, p in enumerate(target_phonemes):
+        if target_counts[i] > 0:
+            dur = target_durations[i] / target_counts[i]
+        else:
+            dur = sum(ref_durations) / len(ref_durations)  # fallback
+        result.append((p, dur))
+
+    return result
+
+
+def phoneme_durations_to_block_sizes(
+    phoneme_durations: list,
     target_total_latents: int,
-    min_block_size: int = 16,
-    num_blocks: int = 8,
-) -> list:
+    min_block_size: int = 8,
+    group_threshold: float = 0.05,
+) -> tuple:
     """
-    Extract rhythm/timing information from audio and convert to block sizes.
+    Convert phoneme durations to generation block sizes.
 
-    This analyzes the energy envelope of the audio to determine speaking rhythm
-    and maps it to block sizes for generation.
+    Groups adjacent phonemes into blocks to avoid excessive fragmentation
+    while preserving the overall rhythm pattern.
+
+    Args:
+        phoneme_durations: List of (phoneme, duration_seconds) tuples
+        target_total_latents: Total latents to generate
+        min_block_size: Minimum block size (must be >= 4)
+        group_threshold: Minimum duration (seconds) before starting new block
+
+    Returns:
+        tuple: (block_sizes, phoneme_groups)
     """
-    # Encode the rhythm source audio to latents
-    rhythm_latent = ae_encode(fish_ae, pca_state, rhythm_audio.unsqueeze(0))
-    rhythm_len = rhythm_latent.shape[1]
+    if not phoneme_durations:
+        return [target_total_latents], [["<empty>"]]
 
-    # Compute energy per latent frame (simple L2 norm)
-    energy = torch.norm(rhythm_latent[0], dim=-1)
+    total_duration = sum(d for _, d in phoneme_durations)
+    latents_per_second = target_total_latents / total_duration if total_duration > 0 else 21.5
 
-    # Normalize and segment into blocks
-    # We'll create blocks proportional to the rhythm audio duration
-    scale_factor = target_total_latents / rhythm_len
+    # Group phonemes into blocks
+    groups = []
+    current_group = []
+    current_duration = 0.0
 
-    # Split rhythm into num_blocks segments and compute relative durations
-    segment_size = rhythm_len // num_blocks
+    for phoneme, duration in phoneme_durations:
+        current_group.append(phoneme)
+        current_duration += duration
+
+        # Start new block if duration exceeds threshold
+        if current_duration >= group_threshold:
+            groups.append((current_group, current_duration))
+            current_group = []
+            current_duration = 0.0
+
+    # Add remaining phonemes
+    if current_group:
+        groups.append((current_group, current_duration))
+
+    # Convert durations to latent counts
     block_sizes = []
+    phoneme_groups = []
 
-    for i in range(num_blocks):
-        start = i * segment_size
-        end = start + segment_size if i < num_blocks - 1 else rhythm_len
+    for phones, duration in groups:
+        latents = int(duration * latents_per_second)
+        latents = max(min_block_size, (latents // 4) * 4)
+        block_sizes.append(latents)
+        phoneme_groups.append(phones)
 
-        # Use segment length scaled to target
-        seg_len = end - start
-        block_size = int(seg_len * scale_factor)
-        block_size = max(min_block_size, block_size)
-        # Round to multiple of 4 for model compatibility
-        block_size = (block_size // 4) * 4
-        if block_size < 4:
-            block_size = 4
-        block_sizes.append(block_size)
-
-    # Adjust to match target total
+    # Adjust to match target exactly
     current_total = sum(block_sizes)
     if current_total != target_total_latents:
         diff = target_total_latents - current_total
-        # Distribute difference across blocks
-        per_block = diff // len(block_sizes)
-        remainder = diff % len(block_sizes)
-        for i in range(len(block_sizes)):
-            adjustment = per_block + (1 if i < abs(remainder) else 0)
-            if diff < 0:
-                adjustment = -abs(adjustment)
-            block_sizes[i] = max(4, block_sizes[i] + adjustment)
-            # Keep divisible by 4
-            block_sizes[i] = (block_sizes[i] // 4) * 4
 
-    # Final adjustment to hit exact target
+        if diff > 0:
+            # Distribute extra latents proportionally
+            for i in range(len(block_sizes)):
+                add = int(diff * (block_sizes[i] / current_total)) if current_total > 0 else diff // len(block_sizes)
+                block_sizes[i] += (add // 4) * 4
+        else:
+            # Remove from largest blocks
+            diff = abs(diff)
+            while diff > 0 and any(b > min_block_size for b in block_sizes):
+                max_idx = max(range(len(block_sizes)), key=lambda i: block_sizes[i])
+                remove = min(4, diff, block_sizes[max_idx] - min_block_size)
+                if remove <= 0:
+                    break
+                block_sizes[max_idx] -= remove
+                diff -= remove
+
+    # Final adjustment on last block
     current_total = sum(block_sizes)
     if current_total != target_total_latents:
         diff = target_total_latents - current_total
         block_sizes[-1] = max(4, block_sizes[-1] + diff)
 
-    return block_sizes
+    return block_sizes, phoneme_groups
+
+
+def extract_rhythm_block_sizes(
+    rhythm_audio: torch.Tensor,
+    target_text: str,
+    target_total_latents: int,
+    min_block_size: int = 8,
+    group_threshold: float = 0.08,
+) -> tuple:
+    """
+    Extract phoneme-level timing from reference audio and map to target text.
+
+    This performs:
+    1. Phoneme recognition on reference audio (wav2vec2)
+    2. Grapheme-to-phoneme conversion on target text
+    3. DTW alignment between reference and target phoneme sequences
+    4. Duration transfer from reference to target
+    5. Conversion to generation block sizes
+
+    Returns:
+        tuple: (block_sizes, rhythm_info_dict)
+    """
+    # Extract phonemes from reference audio
+    ref_phonemes = extract_phonemes_from_audio(rhythm_audio)
+
+    # Convert target text to phonemes
+    target_phonemes = text_to_phonemes(target_text)
+
+    # Align and transfer durations
+    aligned_durations = align_phoneme_sequences(ref_phonemes, target_phonemes)
+
+    # Convert to block sizes
+    block_sizes, phoneme_groups = phoneme_durations_to_block_sizes(
+        aligned_durations,
+        target_total_latents,
+        min_block_size,
+        group_threshold,
+    )
+
+    # Build info dict
+    ref_duration = ref_phonemes[-1][2] if ref_phonemes else 0
+    rhythm_info = {
+        'ref_phonemes': ref_phonemes,
+        'ref_phoneme_count': len(ref_phonemes),
+        'ref_duration': ref_duration,
+        'target_phonemes': target_phonemes,
+        'target_phoneme_count': len(target_phonemes),
+        'aligned_durations': aligned_durations,
+        'phoneme_groups': phoneme_groups,
+        'num_blocks': len(block_sizes),
+    }
+
+    return block_sizes, rhythm_info
 
 
 def generate_audio_rhythm_transfer(
@@ -532,7 +814,7 @@ def generate_audio_rhythm_transfer(
     speaker_audio_path: str,
     rhythm_source_path: str,
     target_duration_seconds: float,
-    num_rhythm_blocks: int,
+    phoneme_group_threshold: float,
     num_steps: int,
     rng_seed: int,
     cfg_scale_text: float,
@@ -549,7 +831,18 @@ def generate_audio_rhythm_transfer(
     audio_format: str,
     session_id: str,
 ) -> Tuple[Any, Any, Any, Any]:
-    """Generate audio using rhythm/timing extracted from a reference audio clip."""
+    """Generate audio using phoneme-level rhythm/timing extracted from a reference audio clip.
+
+    This performs:
+    1. Phoneme recognition on reference audio using wav2vec2
+    2. Grapheme-to-phoneme conversion on the target text
+    3. DTW alignment between reference and target phoneme sequences
+    4. Duration transfer from reference phonemes to target phonemes
+    5. Conversion to generation block sizes
+
+    The result is speech that follows the same rhythm pattern as the reference,
+    with similar phoneme durations and pacing.
+    """
 
     cleanup_temp_audio(TEMP_AUDIO_DIR, session_id)
     start_time = time.time()
@@ -565,6 +858,14 @@ def generate_audio_rhythm_transfer(
             gr.update(value="", visible=False),
         )
 
+    if not text_prompt or not text_prompt.strip():
+        return (
+            gr.update(),
+            gr.update(value=None, visible=True),
+            gr.update(value="**Error:** Please provide a text prompt for rhythm transfer.", visible=True),
+            gr.update(value="", visible=False),
+        )
+
     # Parse parameters
     num_steps_int = min(max(int(num_steps), 1), 80)
     rng_seed_int = int(rng_seed) if rng_seed is not None else 0
@@ -576,7 +877,7 @@ def generate_audio_rhythm_transfer(
     rescale_k_val = float(rescale_k) if rescale_k != 1.0 else None
     rescale_sigma_val = float(rescale_sigma)
     target_duration = float(target_duration_seconds) if target_duration_seconds else 10.0
-    num_blocks = int(num_rhythm_blocks) if num_rhythm_blocks else 8
+    group_threshold = float(phoneme_group_threshold) if phoneme_group_threshold else 0.08
 
     speaker_kv_enabled = bool(force_speaker)
     if speaker_kv_enabled:
@@ -604,20 +905,29 @@ def generate_audio_rhythm_transfer(
     target_latents = min(int(target_duration * 44100 / 2048), 640)
     target_latents = (target_latents // 4) * 4  # Ensure divisible by 4
 
-    # Extract rhythm-based block sizes
-    block_sizes = extract_rhythm_block_sizes(
-        rhythm_audio,
-        target_total_latents=target_latents,
-        min_block_size=16,
-        num_blocks=num_blocks,
-    )
-
-    # Prepare text
+    # Prepare text (get normalized version for phoneme extraction)
     text_input_ids, text_mask, normalized_text = get_text_input_ids_and_mask(
         [text_prompt], max_length=None, device=device, normalize=True, return_normalized_text=True
     )
 
-    # Generate using blockwise sampling with rhythm-derived blocks
+    # Extract phoneme-based block sizes
+    try:
+        block_sizes, rhythm_info = extract_rhythm_block_sizes(
+            rhythm_audio,
+            target_text=normalized_text[0],
+            target_total_latents=target_latents,
+            min_block_size=8,
+            group_threshold=group_threshold,
+        )
+    except Exception as e:
+        return (
+            gr.update(),
+            gr.update(value=None, visible=True),
+            gr.update(value=f"**Error during phoneme extraction:** {str(e)}\n\nMake sure `transformers` and `g2p_en` are installed.", visible=True),
+            gr.update(value="", visible=False),
+        )
+
+    # Generate using blockwise sampling with phoneme-derived blocks
     latent_out = sample_blockwise_euler_cfg_independent_guidances(
         model=model,
         speaker_latent=speaker_latent,
@@ -651,9 +961,39 @@ def generate_audio_rhythm_transfer(
     generation_time = time.time() - start_time
     time_str = f"⏱️ Total generation time: {generation_time:.2f}s"
 
-    # Format block sizes for display
+    # Format detailed phoneme analysis for display
     block_info = ", ".join([str(b) for b in block_sizes])
-    text_display = f"**Text Prompt (normalized):**\n\n{normalized_text[0]}\n\n**Rhythm Transfer Info:**\n- Target duration: {target_duration:.1f}s ({target_latents} latents)\n- Number of blocks: {len(block_sizes)}\n- Block sizes: [{block_info}]"
+
+    # Format phoneme groups
+    phoneme_groups = rhythm_info.get('phoneme_groups', [])
+    groups_display = " | ".join([" ".join(g) for g in phoneme_groups[:10]])
+    if len(phoneme_groups) > 10:
+        groups_display += f" ... (+{len(phoneme_groups) - 10} more)"
+
+    # Sample of reference phonemes
+    ref_phonemes = rhythm_info.get('ref_phonemes', [])
+    ref_sample = ", ".join([f"{p[0]}({p[2]-p[1]:.2f}s)" for p in ref_phonemes[:8]])
+    if len(ref_phonemes) > 8:
+        ref_sample += f" ... (+{len(ref_phonemes) - 8} more)"
+
+    text_display = f"""**Text Prompt (normalized):**
+
+{normalized_text[0]}
+
+**Phoneme Analysis:**
+- Reference phonemes detected: {rhythm_info.get('ref_phoneme_count', 0)}
+- Reference duration: {rhythm_info.get('ref_duration', 0):.2f}s
+- Target phonemes (G2P): {rhythm_info.get('target_phoneme_count', 0)}
+- Reference sample: {ref_sample}
+
+**Alignment & Transfer:**
+- Phoneme groups: {len(phoneme_groups)}
+- Groups preview: {groups_display}
+
+**Generation:**
+- Target duration: {target_duration:.1f}s ({target_latents} latents)
+- Blocks: {len(block_sizes)}
+- Block sizes: [{block_info}]"""
 
     return (
         gr.update(),
@@ -1046,17 +1386,22 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
     # Rhythm Transfer Mode Settings
     with gr.Accordion("🎵 Rhythm Transfer Settings", open=True, visible=False) as rhythm_settings:
         gr.Markdown("""
-        **Rhythm Transfer Mode** extracts the speaking rhythm/pacing from a reference audio and applies it to new speech.
+        **Rhythm Transfer Mode** extracts phoneme-level timing from a reference audio and applies it to new speech.
 
-        - Upload a reference audio whose rhythm you want to mimic
-        - The generated audio will have similar pacing and timing patterns
-        - This works by analyzing the reference and creating block sizes that match its temporal structure
+        The algorithm:
+        1. **Phoneme Recognition**: Extracts phonemes + timings from reference audio (wav2vec2)
+        2. **Text-to-Phoneme**: Converts your target text to phonemes (G2P)
+        3. **DTW Alignment**: Aligns reference phonemes to target phonemes
+        4. **Duration Transfer**: Maps reference durations to target phonemes
+        5. **Block Generation**: Creates generation blocks matching the rhythm pattern
+
+        *Requires: `transformers` and `g2p_en` packages*
         """)
         with gr.Row():
             rhythm_source_input = gr.Audio(
                 sources=["upload", "microphone"],
                 type="filepath",
-                label="Rhythm Source Audio",
+                label="Rhythm Source Audio (speech to copy rhythm from)",
                 max_length=60,
             )
             with gr.Column():
@@ -1068,14 +1413,13 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                     maximum=30.0,
                     step=0.5,
                 )
-                rhythm_num_blocks = gr.Number(
-                    label="Number of Rhythm Blocks",
-                    value=8,
-                    info="How many blocks to divide the generation into (more = finer rhythm control)",
-                    minimum=2,
-                    maximum=32,
-                    step=1,
-                    precision=0,
+                rhythm_group_threshold = gr.Number(
+                    label="Phoneme Group Threshold (seconds)",
+                    value=0.08,
+                    info="Min duration before starting new block (lower = more blocks, finer rhythm)",
+                    minimum=0.02,
+                    maximum=0.5,
+                    step=0.01,
                 )
 
     with gr.Row():
@@ -1376,7 +1720,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
         continuation_new_latents_val,
         rhythm_source_path,
         rhythm_target_duration_val,
-        rhythm_num_blocks_val,
+        rhythm_group_threshold_val,
         num_steps_val,
         rng_seed_val,
         cfg_scale_text_val,
@@ -1441,7 +1785,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
                 speaker_audio_path=speaker_audio_path,
                 rhythm_source_path=rhythm_source_path,
                 target_duration_seconds=rhythm_target_duration_val,
-                num_rhythm_blocks=rhythm_num_blocks_val,
+                phoneme_group_threshold=rhythm_group_threshold_val,
                 num_steps=num_steps_val,
                 rng_seed=rng_seed_val,
                 cfg_scale_text=cfg_scale_text_val,
@@ -1509,7 +1853,7 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
             continuation_new_latents,
             rhythm_source_input,
             rhythm_target_duration,
-            rhythm_num_blocks,
+            rhythm_group_threshold,
             num_steps,
             rng_seed,
             cfg_scale_text,
