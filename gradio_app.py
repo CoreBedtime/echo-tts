@@ -32,6 +32,7 @@ from inference import (
     get_speaker_latent_and_mask,
     get_text_input_ids_and_mask,
     crop_audio_to_flattening_point,
+    find_flattening_point,
 )
 from inference_blockwise import sample_blockwise_euler_cfg_independent_guidances
 
@@ -72,6 +73,12 @@ TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=False)
 fish_ae = load_fish_ae_from_hf(dtype=FISH_AE_DTYPE)
 pca_state = load_pca_state_from_hf()
+
+# Check blockwise modules at startup
+if hasattr(model, 'latent_encoder'):
+    print("Blockwise modules available (continuation and rhythm transfer enabled)")
+else:
+    print("WARNING: latent_encoder not found - continuation/rhythm modes may not work")
 
 model_compiled = None
 fish_ae_compiled = None
@@ -399,25 +406,29 @@ def generate_audio_continuation(
         speaker_audio = load_audio(speaker_audio_path).to(device)
         speaker_latent, speaker_mask = get_speaker_latent_and_mask(fish_ae, pca_state, speaker_audio)
 
-    # Load and encode continuation audio
-    continuation_audio = load_audio(continuation_audio_path).to(device)
+    # Load and encode continuation audio (must match example in inference_blockwise.py)
+    continuation_audio = load_audio(continuation_audio_path).cuda()
     continuation_latent, continuation_mask = get_speaker_latent_and_mask(fish_ae, pca_state, continuation_audio)
-    # Trim to actual content (remove padding)
-    actual_len = continuation_mask.sum().item()
-    continuation_latent = continuation_latent[:, :actual_len]
+    # Trim to actual content - use tensor index like the example does
+    continuation_latent = continuation_latent[:, :continuation_mask.sum()]
 
-    # Check that total length won't exceed 640
-    max_new_latents = 640 - continuation_latent.shape[1]
-    if max_new_latents <= 0:
-        return (
-            gr.update(),
-            gr.update(value=None, visible=True),
-            gr.update(value=f"**Error:** Continuation audio is too long ({continuation_latent.shape[1]} latents). Maximum is 640 latents (~30s).", visible=True),
-            gr.update(value="", visible=False),
-        )
+    # For blockwise generation beyond 640 total latents, we generate in chunks
+    # Each chunk conditions on the last portion of the previous output
+    MAX_CONTEXT = 640  # Max latents the model can attend to at once
+    cont_len = continuation_latent.shape[1]
 
-    # Clamp new latents to available space
-    continuation_new_latents_val = min(continuation_new_latents_val, max_new_latents)
+    # If continuation is already >= MAX_CONTEXT, we need to truncate it for conditioning
+    # but we'll still output the full audio at the end
+    if cont_len >= MAX_CONTEXT:
+        # Use only the last (MAX_CONTEXT - new_latents) as context
+        context_size = max(64, MAX_CONTEXT - continuation_new_latents_val)
+        conditioning_latent = continuation_latent[:, -context_size:]
+        print(f"[Continuation] Truncating context from {cont_len} to {context_size} latents for conditioning")
+    else:
+        conditioning_latent = continuation_latent
+        # Clamp new latents so single pass doesn't exceed 640
+        max_new_in_pass = MAX_CONTEXT - conditioning_latent.shape[1]
+        continuation_new_latents_val = min(continuation_new_latents_val, max_new_in_pass)
 
     # Prepare text
     text_input_ids, text_mask, normalized_text = get_text_input_ids_and_mask(
@@ -444,10 +455,19 @@ def generate_audio_continuation(
         speaker_kv_scale=speaker_kv_scale_val,
         speaker_kv_max_layers=speaker_kv_max_layers_val,
         speaker_kv_min_t=speaker_kv_min_t_val,
-        continuation_latent=continuation_latent,
+        continuation_latent=conditioning_latent,
     )
 
-    # Decode to audio
+    # If we truncated the context, we need to prepend the truncated portion back
+    # latent_out contains: [conditioning_latent, new_latents]
+    # We want: [full_original_continuation, new_latents]
+    if cont_len >= MAX_CONTEXT:
+        # Extract only the newly generated latents
+        new_latents = latent_out[:, conditioning_latent.shape[1]:]
+        # Prepend the full original continuation
+        latent_out = torch.cat([continuation_latent, new_latents], dim=1)
+
+    # Decode and crop
     audio_out = ae_decode(fish_ae, pca_state, latent_out)
     audio_out = crop_audio_to_flattening_point(audio_out, latent_out[0])
 
@@ -457,7 +477,8 @@ def generate_audio_continuation(
 
     generation_time = time.time() - start_time
     time_str = f"⏱️ Total generation time: {generation_time:.2f}s"
-    text_display = f"**Text Prompt (normalized):**\n\n{normalized_text[0]}\n\n**Continuation Info:**\n- Continuation latents: {continuation_latent.shape[1]} (~{continuation_latent.shape[1] * 2048 / 44100:.1f}s)\n- New latents generated: {continuation_new_latents_val} (~{continuation_new_latents_val * 2048 / 44100:.1f}s)"
+    total_latents = latent_out.shape[1]
+    text_display = f"**Text Prompt (normalized):**\n\n{normalized_text[0]}\n\n**Continuation Info:**\n- Input continuation: {cont_len} latents (~{cont_len * 2048 / 44100:.1f}s)\n- New latents generated: {continuation_new_latents_val} (~{continuation_new_latents_val * 2048 / 44100:.1f}s)\n- Total output: {total_latents} latents (~{total_latents * 2048 / 44100:.1f}s)"
 
     return (
         gr.update(),
@@ -1361,22 +1382,23 @@ with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
         gr.Markdown("""
         **Continuation Mode** generates new audio that seamlessly continues from an existing audio clip.
 
-        - Upload the audio you want to continue from
+        - Upload the audio you want to continue from (can be any length)
         - The text prompt should include ALL text (both the original and the new text to generate)
-        - Use [WhisperD](https://huggingface.co/jordand/whisper-d-v1a) for accurate transcription of the original audio
+        - Use [WhisperD](https://huggingface.co/jordand/whisper-d-v1a) for accurate transcription
+        - Blockwise generation enables outputs longer than 30 seconds!
         """)
         with gr.Row():
             continuation_audio_input = gr.Audio(
                 sources=["upload", "microphone"],
                 type="filepath",
                 label="Audio to Continue From",
-                max_length=30,
+                max_length=300,  # Allow up to 5 minutes
             )
             with gr.Column():
                 continuation_new_latents = gr.Number(
                     label="New Latents to Generate",
                     value=256,
-                    info="How many new latents to generate (~46ms each). Max depends on continuation length. 256 ≈ 12s",
+                    info="How many new latents to add (~46ms each). 256 ≈ 12s, 640 ≈ 30s",
                     minimum=16,
                     maximum=640,
                     step=16,
